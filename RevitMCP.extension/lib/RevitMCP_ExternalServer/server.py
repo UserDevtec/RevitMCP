@@ -81,6 +81,31 @@ try:
     DEBUG_MODE = os.environ.get('FLASK_DEBUG_MODE', 'False').lower() == 'true'
     PORT = int(os.environ.get('FLASK_PORT', 8000))
     HOST = os.environ.get('FLASK_HOST', '127.0.0.1')
+
+    def resolve_runtime_surface(argv_values):
+        """Resolve runtime surface from CLI args or environment."""
+        valid_surfaces = ('web', 'mcp')
+        cli_surface = None
+
+        for i, arg in enumerate(argv_values):
+            if arg.startswith('--surface='):
+                cli_surface = arg.split('=', 1)[1].strip().lower()
+                break
+            if arg == '--surface' and i + 1 < len(argv_values):
+                cli_surface = argv_values[i + 1].strip().lower()
+                break
+
+        env_surface = os.environ.get('REVITMCP_SURFACE', '').strip().lower()
+        requested_surface = cli_surface or env_surface or 'web'
+
+        if requested_surface not in valid_surfaces:
+            startup_logger.warning(
+                "Invalid runtime surface '%s'. Falling back to 'web'. Valid values: %s",
+                requested_surface, ', '.join(valid_surfaces)
+            )
+            return 'web'
+
+        return requested_surface
     
     configure_flask_logger(app, DEBUG_MODE)
     app.logger.info(
@@ -246,9 +271,18 @@ try:
                 status_code = e_req.response.status_code
                 try:
                     listener_err_data = e_req.response.json()
+                    listener_message = str(listener_err_data.get('message', listener_err_data.get('error', 'Unknown API error')))
+                    route_exception_message = ""
+                    if isinstance(listener_err_data.get('exception'), dict):
+                        route_exception_message = str(listener_err_data['exception'].get('message', ''))
+                    is_missing_route = "RouteHandlerNotDefinedException" in listener_message or "RouteHandlerNotDefinedException" in route_exception_message
                     full_msg = f"{msg_prefix}: HTTP {status_code}. API Response: {listener_err_data.get('message', listener_err_data.get('error', 'Unknown API error'))}"
                     logger_instance.error(full_msg, exc_info=False) # No need for exc_info if we have API message
-                    return {"status": "error", "message": full_msg, "details": listener_err_data}
+                    result = {"status": "error", "message": full_msg, "details": listener_err_data}
+                    if is_missing_route:
+                        result["error_type"] = "route_not_defined"
+                        result["missing_route"] = command_path
+                    return result
                 except ValueError:
                     full_msg = f"{msg_prefix}: HTTP {status_code}. Response: {e_req.response.text[:200]}"
                     logger_instance.error(full_msg, exc_info=True)
@@ -259,6 +293,18 @@ try:
         except Exception as e_gen:
             logger_instance.error(f"Unexpected error in call_revit_listener for {command_path} at {REVIT_MCP_API_BASE_URL}: {e_gen}", exc_info=True)
             return {"status": "error", "message": f"Unexpected error processing API response for {command_path}."}
+
+    def _is_route_not_defined(result: dict, route_hint: str = None) -> bool:
+        """Return True when a tool result represents a missing pyRevit route."""
+        if not isinstance(result, dict):
+            return False
+        if result.get("error_type") == "route_not_defined":
+            return True
+        text_parts = [str(result.get("message", "")), str(result.get("details", ""))]
+        if route_hint:
+            text_parts.append(str(route_hint))
+        text = " ".join(text_parts)
+        return "RouteHandlerNotDefinedException" in text
 
     # --- MCP Tool Definitions using @mcp_server.tool() ---
     @mcp_server.tool(name=REVIT_INFO_TOOL_NAME) # Name must match what LLM will use
@@ -361,8 +407,22 @@ try:
                 "selection_limit": MAX_ELEMENTS_FOR_SELECTION
             }
 
-        # Use the focused selection approach - just select and keep selected
+        # Prefer focused selection when available, but gracefully fall back for older route sets.
         result = call_revit_listener(command_path='/select_elements_focused', method='POST', payload_data={"element_ids": element_ids})
+        if result.get("status") == "error":
+            if _is_route_not_defined(result, "/select_elements_focused") or "select_elements_focused" in str(result.get("message", "")):
+                app.logger.warning(
+                    "Route '/select_elements_focused' is not available on the active Revit API. "
+                    "Falling back to '/select_elements_by_id'."
+                )
+                fallback_result = call_revit_listener(
+                    command_path='/select_elements_by_id',
+                    method='POST',
+                    payload_data={"element_ids": element_ids}
+                )
+                if fallback_result.get("status") == "success":
+                    fallback_result["approach_note"] = "Fallback selection used because focused selection route was unavailable"
+                result = fallback_result
 
         # Add storage info to the result
         if result.get("status") == "success":
@@ -400,6 +460,22 @@ try:
             payload["parameters"] = parameters
         
         result = call_revit_listener(command_path='/elements/filter', method='POST', payload_data=payload)
+
+        if result.get("status") == "error" and _is_route_not_defined(result, "/elements/filter"):
+            # Compatibility fallback: if no advanced filters were requested, use category retrieval.
+            if not level_name and not parameters:
+                app.logger.warning("Route '/elements/filter' missing. Falling back to '/get_elements_by_category' for category-only request.")
+                result = call_revit_listener(
+                    command_path='/get_elements_by_category',
+                    method='POST',
+                    payload_data={"category_name": category_name}
+                )
+            else:
+                return {
+                    "status": "error",
+                    "error_type": "route_not_defined",
+                    "message": "The active Revit route set does not support '/elements/filter'. Reload/update the Revit extension to use advanced filtering."
+                }
         
         # Automatically store the results if successful
         if result.get("status") == "success" and "element_ids" in result:
@@ -425,7 +501,14 @@ try:
         if parameter_names:
             payload["parameter_names"] = parameter_names
         
-        return call_revit_listener(command_path='/elements/get_properties', method='POST', payload_data=payload)
+        result = call_revit_listener(command_path='/elements/get_properties', method='POST', payload_data=payload)
+        if result.get("status") == "error" and _is_route_not_defined(result, "/elements/get_properties"):
+            return {
+                "status": "error",
+                "error_type": "route_not_defined",
+                "message": "The active Revit route set does not support '/elements/get_properties'. Reload/update the Revit extension to enable property reads."
+            }
+        return result
 
     @mcp_server.tool(name=UPDATE_ELEMENT_PARAMETERS_TOOL_NAME)
     def update_element_parameters_mcp_tool(
@@ -471,11 +554,18 @@ try:
 
         app.logger.info(f"Prepared {len(normalized_updates)} parameter update(s) for execution.")
 
-        return call_revit_listener(
+        result = call_revit_listener(
             command_path='/elements/update_parameters',
             method='POST',
             payload_data={"updates": normalized_updates}
         )
+        if result.get("status") == "error" and _is_route_not_defined(result, "/elements/update_parameters"):
+            return {
+                "status": "error",
+                "error_type": "route_not_defined",
+                "message": "The active Revit route set does not support '/elements/update_parameters'. Reload/update the Revit extension to enable parameter updates."
+            }
+        return result
 
     
     @mcp_server.tool(name=PLACE_VIEW_ON_SHEET_TOOL_NAME)
@@ -623,8 +713,18 @@ try:
                             # Tools that take parameters
                             result = tool_function(**tool_params)
                         
-                        step_info["status"] = "completed"
                         step_info["result"] = result
+
+                        result_status = ""
+                        if isinstance(result, dict):
+                            result_status = str(result.get("status", "")).lower()
+
+                        if result_status in ["error", "failed", "limit_exceeded"]:
+                            step_info["status"] = "error"
+                            if isinstance(result, dict) and "message" in result:
+                                step_info["error"] = result.get("message")
+                        else:
+                            step_info["status"] = "completed"
                         
                         # Store results for potential use in subsequent steps
                         # This allows chaining where one step's output feeds into the next
@@ -830,10 +930,15 @@ try:
     app.logger.info("Manual tool specs for LLMs defined.")
 
     ANTHROPIC_MODEL_ID_MAP = {
-        "claude-4-sonnet": "claude-sonnet-4-20250514",    # Updated based on user's table
-        "claude-4-opus": "claude-opus-4-20250514",        # Updated based on user's table
-        "claude-3-7-sonnet": "claude-3-7-sonnet-20250219",  # Updated based on user's table
-        "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",  # Updated based on user's table
+        # Current model IDs
+        "claude-sonnet-4-6": "claude-sonnet-4-6",
+        "claude-opus-4-6": "claude-opus-4-6",
+        "claude-haiku-4-5": "claude-haiku-4-5",
+        # Backward compatibility with older saved UI values
+        "claude-4-sonnet": "claude-sonnet-4-6",
+        "claude-4-opus": "claude-opus-4-6",
+        "claude-3-7-sonnet": "claude-3-7-sonnet-20250219",
+        "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
     }
     app.logger.info("Configuration loaded.")
 
@@ -966,7 +1071,7 @@ Use plan_and_execute_workflow for multi-step operations to provide complete resu
                 model_reply_text = f"Echo: {conversation_history[-1]['content']}"
             
             # --- OpenAI Models ---
-            elif selected_model_ui_name.startswith('gpt-') or selected_model_ui_name.startswith('o3'):
+            elif selected_model_ui_name.startswith('gpt-') or selected_model_ui_name.startswith('o'):
                 client = openai.OpenAI(api_key=api_key)
                 messages_for_llm = [planning_system_prompt] + [{"role": "assistant" if msg['role'] == 'bot' else msg['role'], "content": msg['content']} for msg in conversation_history]
                 max_tool_iterations = 5
@@ -1200,11 +1305,20 @@ Use plan_and_execute_workflow for multi-step operations to provide complete resu
     # input("Press Enter to continue launching Flask server...") # Python 3
 
     if __name__ == '__main__':
-        startup_logger.info(f"--- Starting Flask development server on host {HOST}, port {PORT} ---")
-        print(f"--- Debug mode for app.run is: {DEBUG_MODE} ---")
+        runtime_surface = resolve_runtime_surface(sys.argv[1:])
+        startup_logger.info("--- Runtime surface selected: %s ---", runtime_surface)
+        print(f"--- Runtime surface selected: {runtime_surface} ---")
+
         try:
-            app.run(debug=DEBUG_MODE, port=PORT, host=HOST)
-            startup_logger.info("Flask app.run() exited normally.")
+            if runtime_surface == 'mcp':
+                startup_logger.info("--- Starting FastMCP server over stdio transport ---")
+                mcp_server.run(transport='stdio')
+                startup_logger.info("FastMCP server exited normally.")
+            else:
+                startup_logger.info(f"--- Starting Flask development server on host {HOST}, port {PORT} ---")
+                print(f"--- Debug mode for app.run is: {DEBUG_MODE} ---")
+                app.run(debug=DEBUG_MODE, port=PORT, host=HOST)
+                startup_logger.info("Flask app.run() exited normally.")
         except OSError as e_os:
             startup_logger.error(f"OS Error during server startup (app.run): {e_os}", exc_info=True)
             print(f"OS Error: {e_os}")

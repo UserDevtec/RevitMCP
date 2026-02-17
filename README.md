@@ -24,7 +24,7 @@ The tool automatically:
 - Places views in the center of sheets
 - Handles titleblock selection and viewport creation
 
-See `Sheet_Placement_Tool_Documentation.md` for complete usage details.
+See `RevitMCP.extension/lib/RevitMCP_Tools/sheet_placement_tool.py` and `RevitMCP.extension/lib/routes/sheet_routes.py` for implementation details.
 
 This README provides instructions on how to set up and use the `RevitMCP.extension`.
 
@@ -91,6 +91,101 @@ The system consists of two main parts that need to be running:
 
 **Workflow Summary:**
    `AI Assistant/Client App`  ->  `External Server (server.py on e.g., port 8000)`  ->  `pyRevit Routes API (in Revit on e.g., port 48884)`
+
+## Runtime Surfaces
+
+`server.py` supports two runtime surfaces so users can choose where they interact:
+
+1.  **`web` surface (default):**
+    *   Runs the Flask chat UI on localhost.
+    *   Best for browser-based interaction at `http://127.0.0.1:8000`.
+
+2.  **`mcp` surface:**
+    *   Runs MCP over stdio for Claude Desktop local MCP servers.
+    *   Best for direct Claude tool use without the web UI.
+
+### How Surface Is Selected
+
+Surface selection priority is:
+
+1.  CLI argument: `--surface web` or `--surface mcp`
+2.  Environment variable: `REVITMCP_SURFACE`
+3.  Default: `web`
+
+Examples:
+
+```powershell
+# Web UI mode
+python server.py --surface web
+
+# Claude Desktop MCP mode
+python server.py --surface mcp
+```
+
+For pyRevit launcher users, the surface is read from:
+`%USERPROFILE%\Documents\RevitMCP\user_data\revitmcp_settings.json`
+
+```json
+{
+  "preferences": {
+    "server_surface": "web"
+  }
+}
+```
+
+Use `"mcp"` to launch in Claude Desktop mode.
+
+## Claude Desktop (Local MCP) Setup
+
+Add this to Claude Desktop config (`%APPDATA%\Claude\claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "revitmcp": {
+      "command": "python",
+      "args": [
+        "C:\\Users\\<your-user>\\Documents\\RevitMCP\\RevitMCP\\RevitMCP.extension\\lib\\RevitMCP_ExternalServer\\server.py",
+        "--surface",
+        "mcp"
+      ]
+    }
+  }
+}
+```
+
+Then fully restart Claude Desktop.
+
+## Claude Desktop Usage Guide
+
+After setup:
+
+1.  Open Revit with a project loaded and ensure pyRevit Routes is enabled.
+2.  Open Claude Desktop.
+3.  Start a new chat and ask tool-driven prompts such as:
+    *   `Get Revit project info`
+    *   `List views that can be placed on sheets`
+    *   `Get elements by category Walls`
+4.  If needed, open Claude Desktop -> Settings -> Developer -> Local MCP Servers -> `revitmcp` -> `View Logs`.
+
+Notes:
+*   Claude Desktop local MCP mode does not use the web UI model dropdown.
+*   In MCP mode, model selection is whatever Claude model you choose in Claude Desktop itself.
+
+## Web UI Model Catalog (Updated for Feb 2026)
+
+The web surface (`--surface web`) model dropdown currently includes:
+
+*   OpenAI:
+    *   `gpt-5.2`
+    *   `gpt-5-mini`
+*   Anthropic:
+    *   `claude-sonnet-4-6`
+    *   `claude-opus-4-6`
+    *   `claude-haiku-4-5`
+*   Google Gemini:
+    *   `gemini-3-pro-preview-02-05`
+    *   `gemini-3-flash-preview-02-05`
 
 ## Troubleshooting
 

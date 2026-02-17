@@ -112,6 +112,7 @@ def _get_default_settings():
         },
         "preferences": {
             "default_model": "echo_model", # A safe default
+            "server_surface": "web", # web | mcp
             "auto_start_servers": False,
             "save_chat_history": True,
             "log_level": "INFO"
@@ -186,6 +187,15 @@ def get_or_create_settings():
         print("[UI_MANAGER] Generating default settings file.")
         settings = _get_default_settings()
         _save_settings_file(settings) # Save the newly created default settings
+    else:
+        # Lightweight migration for older settings files.
+        preferences = settings.get("preferences", {})
+        if not isinstance(preferences, dict):
+            preferences = {}
+            settings["preferences"] = preferences
+        if "server_surface" not in preferences:
+            preferences["server_surface"] = "web"
+            _save_settings_file(settings)
     return settings
 
 # --- End Settings File Management ---
@@ -367,8 +377,15 @@ def start_external_server():
         return
 
     if SERVER_PROCESS is None or SERVER_PROCESS.poll() is not None:
+        preferred_surface = current_settings.get("preferences", {}).get("server_surface", "web")
+        if preferred_surface not in ["web", "mcp"]:
+            print("[UI_MANAGER] Invalid server_surface '{}'. Falling back to 'web'.".format(preferred_surface))
+            preferred_surface = "web"
+
+        launch_cmd = [python_exe_to_use, EXTERNAL_SERVER_SCRIPT_PATH, "--surface", preferred_surface]
         print("[UI_MANAGER] Starting RevitMCP External Server from: {}".format(EXTERNAL_SERVER_SCRIPT_PATH))
         print("[UI_MANAGER] Using Python executable: {}".format(python_exe_to_use))
+        print("[UI_MANAGER] Selected server surface: {}".format(preferred_surface))
         try:
             env = os.environ.copy()
             # Comment out or remove log file redirection
@@ -377,9 +394,9 @@ def start_external_server():
             
             # Open the log file in write mode to overwrite previous logs
             # with open(log_file_path, 'w') as log_file:
-            print("[UI_MANAGER] Starting Popen with command: {} {}".format(python_exe_to_use, EXTERNAL_SERVER_SCRIPT_PATH))
+            print("[UI_MANAGER] Starting Popen with command: {}".format(' '.join(launch_cmd)))
             SERVER_PROCESS = subprocess.Popen(
-                [python_exe_to_use, EXTERNAL_SERVER_SCRIPT_PATH],
+                launch_cmd,
                 env=env,
                 # stdout=log_file, # Removed to allow output to CMD
                 # stderr=log_file, # Removed to allow output to CMD
@@ -387,7 +404,7 @@ def start_external_server():
                 # or if you want to explicitly manage its console.
                 # creationflags=subprocess.CREATE_NO_WINDOW # Keep this commented unless a separate window is not desired
             )
-            success_msg = "[UI_MANAGER] RevitMCP External Server process started. PID: {}. Its console window should appear.".format(SERVER_PROCESS.pid) # Updated message
+            success_msg = "[UI_MANAGER] RevitMCP External Server process started (surface: {}). PID: {}. Its console window should appear.".format(preferred_surface, SERVER_PROCESS.pid)
             print(success_msg)
             show_alert(success_msg)
 
