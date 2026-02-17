@@ -69,13 +69,24 @@ try:
     print("--- RevitMCP External Server script starting (Python print) ---")
 
     app = Flask(__name__, template_folder='templates', static_folder='static')
-    CORS(app)
-    
-    DEBUG_MODE = os.environ.get('FLASK_DEBUG_MODE', 'True').lower() == 'true'
+    # Default to local-only and explicit localhost origins for safer out-of-the-box behavior.
+    default_cors_origins = ["http://localhost:8000", "http://127.0.0.1:8000"]
+    cors_origins_raw = os.environ.get('FLASK_CORS_ORIGINS', '')
+    if cors_origins_raw.strip():
+        cors_origins = [origin.strip() for origin in cors_origins_raw.split(',') if origin.strip()]
+    else:
+        cors_origins = default_cors_origins
+    CORS(app, resources={r"/*": {"origins": cors_origins}})
+
+    DEBUG_MODE = os.environ.get('FLASK_DEBUG_MODE', 'False').lower() == 'true'
     PORT = int(os.environ.get('FLASK_PORT', 8000))
+    HOST = os.environ.get('FLASK_HOST', '127.0.0.1')
     
     configure_flask_logger(app, DEBUG_MODE)
-    app.logger.info("Flask app initialized. Debug mode: %s. Port: %s.", DEBUG_MODE, PORT)
+    app.logger.info(
+        "Flask app initialized. Debug mode: %s. Host: %s. Port: %s. CORS origins: %s.",
+        DEBUG_MODE, HOST, PORT, cors_origins
+    )
     print(f"--- Flask DEBUG_MODE is set to: {DEBUG_MODE} (from print) ---")
 
     # --- MCP Server Instance ---
@@ -1189,10 +1200,10 @@ Use plan_and_execute_workflow for multi-step operations to provide complete resu
     # input("Press Enter to continue launching Flask server...") # Python 3
 
     if __name__ == '__main__':
-        startup_logger.info(f"--- Starting Flask development server on host 0.0.0.0, port {PORT} ---")
+        startup_logger.info(f"--- Starting Flask development server on host {HOST}, port {PORT} ---")
         print(f"--- Debug mode for app.run is: {DEBUG_MODE} ---")
         try:
-            app.run(debug=DEBUG_MODE, port=PORT, host='0.0.0.0')
+            app.run(debug=DEBUG_MODE, port=PORT, host=HOST)
             startup_logger.info("Flask app.run() exited normally.")
         except OSError as e_os:
             startup_logger.error(f"OS Error during server startup (app.run): {e_os}", exc_info=True)
