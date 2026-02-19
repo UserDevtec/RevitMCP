@@ -137,6 +137,9 @@ Use `"mcp"` to launch in Claude Desktop mode.
 
 ## Claude Desktop (Local MCP) Setup
 
+Download Claude Desktop:  
+`https://claude.ai/download`
+
 Add this to Claude Desktop config (`%APPDATA%\Claude\claude_desktop_config.json`):
 
 ```json
@@ -145,7 +148,7 @@ Add this to Claude Desktop config (`%APPDATA%\Claude\claude_desktop_config.json`
     "revitmcp": {
       "command": "python",
       "args": [
-        "C:\\Users\\<your-user>\\Documents\\RevitMCP\\RevitMCP\\RevitMCP.extension\\lib\\RevitMCP_ExternalServer\\server.py",
+        "C:\\Program Files\\pyRevit-Master\\extensions\\RevitMCP.extension\\lib\\RevitMCP_ExternalServer\\server.py",
         "--surface",
         "mcp"
       ]
@@ -154,7 +157,22 @@ Add this to Claude Desktop config (`%APPDATA%\Claude\claude_desktop_config.json`
 }
 ```
 
+Use the actual location of your installed `RevitMCP.extension`.
+
 Then fully restart Claude Desktop.
+
+### Quick Setup (Recommended)
+
+1.  Install Claude Desktop and sign in.
+2.  Open Claude Desktop settings and go to:
+    *   **Developer -> Local MCP Servers** (or **Extensions** in newer UI builds).
+3.  Click **Edit Config** and add the `revitmcp` server JSON shown above.
+4.  Save config and fully restart Claude Desktop.
+5.  Re-open **Developer -> Local MCP Servers** and confirm `revitmcp` shows **running**.
+6.  In a new chat, test with: `Get Revit project info`.
+
+If the Developer page is missing, enable it from Claude Desktop:
+*   **Help -> Troubleshooting -> Enable Developer Mode**
 
 ## Claude Desktop Usage Guide
 
