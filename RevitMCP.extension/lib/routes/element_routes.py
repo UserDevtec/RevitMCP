@@ -2,6 +2,7 @@
 # -*- coding: UTF-8 -*-
 
 from pyrevit import routes, script, DB
+from System.Collections.Generic import List
 
 
 def _resolve_built_in_category(category_name, route_logger):
@@ -34,10 +35,14 @@ def _find_parameter(element, param_name):
     except Exception:
         pass
 
-    # Fallback to manual scan.
+    # Fallback to manual scan with case-insensitive matching.
+    target_name = str(param_name or "").strip().lower()
     for item in element.Parameters:
-        if item and item.Definition and item.Definition.Name == param_name:
-            return item
+        if item and item.Definition and item.Definition.Name:
+            if item.Definition.Name == param_name:
+                return item
+            if str(item.Definition.Name).strip().lower() == target_name:
+                return item
 
     return None
 
@@ -69,6 +74,15 @@ def _get_parameter_display_value(param, doc):
         return param.AsValueString() or ""
     except Exception:
         return "Not available"
+
+
+def _is_meaningful_value(value):
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return False
+    if text.lower() in ("not available", "none", "null"):
+        return False
+    return True
 
 
 def _parse_length_to_internal_feet(value):
@@ -114,6 +128,32 @@ def _set_parameter_value(param, new_value):
             return False, "Could not convert '{}' to integer".format(new_value)
 
     return False, "Unsupported parameter type: {}".format(param.StorageType)
+
+
+def _normalize_element_ids(raw_ids):
+    """Parse incoming element IDs to a list of valid DB.ElementId values."""
+    valid_ids = List[DB.ElementId]()
+    requested_count = 0
+    invalid_ids = []
+
+    if raw_ids is None:
+        return valid_ids, requested_count, invalid_ids
+
+    if isinstance(raw_ids, str):
+        raw_ids = [raw_ids]
+
+    for raw_id in raw_ids:
+        requested_count += 1
+        try:
+            element_id_int = int(str(raw_id).strip())
+            if element_id_int > 0:
+                valid_ids.Add(DB.ElementId(element_id_int))
+            else:
+                invalid_ids.append(str(raw_id))
+        except Exception:
+            invalid_ids.append(str(raw_id))
+
+    return valid_ids, requested_count, invalid_ids
 
 
 def register_routes(api):
@@ -189,6 +229,65 @@ def register_routes(api):
         except Exception as e_main_logic:
             route_logger.critical("Critical error in /get_elements_by_category: {}".format(e_main_logic), exc_info=True)
             return routes.Response(status=500, data={"error": "Internal server error during main logic.", "details": str(e_main_logic)})
+
+    @api.route('/select_elements_by_id', methods=['POST'])
+    def handle_select_elements_by_id(request):
+        """Select provided element IDs in the active document."""
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else None
+            if not payload or not isinstance(payload, dict):
+                return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+            raw_ids = payload.get('element_ids')
+            if not raw_ids:
+                return routes.Response(status=400, data={"error": "Missing 'element_ids'"})
+
+            current_uiapp = __revit__
+            if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
+                return routes.Response(status=503, data={"error": "No active Revit UI document"})
+
+            uidoc = current_uiapp.ActiveUIDocument
+            doc = uidoc.Document
+
+            candidate_ids, requested_count, invalid_ids = _normalize_element_ids(raw_ids)
+            valid_existing_ids = List[DB.ElementId]()
+            selected_ids_processed = []
+
+            for elem_id in candidate_ids:
+                if doc.GetElement(elem_id):
+                    valid_existing_ids.Add(elem_id)
+                    selected_ids_processed.append(str(elem_id.IntegerValue))
+
+            uidoc.Selection.SetElementIds(List[DB.ElementId]())
+            uidoc.Selection.SetElementIds(valid_existing_ids)
+
+            try:
+                uidoc.RefreshActiveView()
+            except Exception:
+                pass
+
+            return {
+                "status": "success",
+                "message": "Selected {} elements.".format(valid_existing_ids.Count),
+                "requested_count": requested_count,
+                "selected_count": valid_existing_ids.Count,
+                "invalid_ids": invalid_ids,
+                "selected_ids_processed": selected_ids_processed
+            }
+
+        except Exception as e:
+            route_logger.critical("Error in /select_elements_by_id: {}".format(e), exc_info=True)
+            return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
+
+    @api.route('/select_elements_focused', methods=['POST'])
+    def handle_select_elements_focused(request):
+        """
+        Focused selection route used by external server.
+        Currently mirrors /select_elements_by_id behavior and keeps selection active.
+        """
+        return handle_select_elements_by_id(request)
 
     @api.route('/elements/filter', methods=['POST'])
     def handle_filter_elements(request):
@@ -338,6 +437,8 @@ def register_routes(api):
                 return routes.Response(status=400, data={"error": "Missing 'element_ids'"})
 
             parameter_names = payload.get('parameter_names', [])
+            include_all_parameters = bool(payload.get('include_all_parameters', False))
+            populated_only = bool(payload.get('populated_only', False))
 
             current_uiapp = __revit__
             if not hasattr(current_uiapp, 'ActiveUIDocument') or not current_uiapp.ActiveUIDocument:
@@ -355,7 +456,40 @@ def register_routes(api):
 
                     properties = {}
 
-                    if not parameter_names:
+                    if include_all_parameters:
+                        # Discover instance parameters first.
+                        for p in element.Parameters:
+                            try:
+                                if not p or not p.Definition or not p.Definition.Name:
+                                    continue
+                                pname = p.Definition.Name
+                                pvalue = _get_parameter_display_value(p, doc)
+                                if populated_only and not _is_meaningful_value(pvalue):
+                                    continue
+                                properties[pname] = pvalue
+                            except Exception:
+                                continue
+
+                        # Include type parameters as fallback discovery source.
+                        try:
+                            symbol = getattr(element, "Symbol", None)
+                            if symbol:
+                                for p in symbol.Parameters:
+                                    try:
+                                        if not p or not p.Definition or not p.Definition.Name:
+                                            continue
+                                        pname = p.Definition.Name
+                                        pvalue = _get_parameter_display_value(p, doc)
+                                        if populated_only and not _is_meaningful_value(pvalue):
+                                            continue
+                                        if pname not in properties or not _is_meaningful_value(properties.get(pname)):
+                                            properties[pname] = pvalue
+                                    except Exception:
+                                        continue
+                        except Exception:
+                            pass
+
+                    elif not parameter_names:
                         category_name = element.Category.Name if element.Category else ""
                         common_params = ["Level", "Family and Type", "Comments"]
                         if category_name == "Windows":
@@ -368,9 +502,10 @@ def register_routes(api):
                     else:
                         names_to_use = parameter_names
 
-                    for param_name in names_to_use:
-                        param = _find_parameter(element, param_name)
-                        properties[param_name] = _get_parameter_display_value(param, doc) if param else "Not available"
+                    if not include_all_parameters:
+                        for param_name in names_to_use:
+                            param = _find_parameter(element, param_name)
+                            properties[param_name] = _get_parameter_display_value(param, doc) if param else "Not available"
 
                     # Enrich with stable, human-readable identity values.
                     try:
@@ -386,6 +521,9 @@ def register_routes(api):
 
                     properties["Element_Name"] = getattr(element, 'Name', 'No Name')
                     properties["Category"] = element.Category.Name if element.Category else "No Category"
+                    properties["available_parameter_names"] = sorted(
+                        [k for k, v in properties.items() if _is_meaningful_value(v) and k not in ("available_parameter_names", "Element_Name", "Category")]
+                    )
 
                     results.append({"element_id": id_str, "properties": properties})
 
