@@ -33,7 +33,8 @@ try:
         from routes import (
             project_routes,
             sheet_routes,
-            element_routes
+            element_routes,
+            schema_routes
         )
         logger.info("Route modules imported successfully")
         
@@ -46,6 +47,9 @@ try:
         
         element_routes.register_routes(api)
         logger.info("Element routes registered successfully")
+
+        schema_routes.register_routes(api)
+        logger.info("Schema routes registered successfully")
         
     except ImportError as ie:
         logger.error("Error importing route modules: {}".format(ie), exc_info=True)
