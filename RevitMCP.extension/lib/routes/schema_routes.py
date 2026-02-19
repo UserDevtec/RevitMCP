@@ -117,9 +117,9 @@ def register_routes(api):
             parameter_names = set()
             sample_limit = 400
             try:
-                sample_elements = DB.FilteredElementCollector(doc).WhereElementIsNotElementType().ToElements()
                 sampled = 0
-                for elem in sample_elements:
+                sample_collector = DB.FilteredElementCollector(doc).WhereElementIsNotElementType()
+                for elem in sample_collector:
                     if sampled >= sample_limit:
                         break
                     sampled += 1
