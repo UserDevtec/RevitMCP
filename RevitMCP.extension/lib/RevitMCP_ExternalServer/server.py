@@ -10,6 +10,10 @@ import sys # Ensure sys is imported for stdout/stderr redirection if used
 import logging
 import traceback # For detailed exception logging
 import json
+import uuid
+import re
+import difflib
+import threading
 from flask import Flask, request, jsonify, render_template
 import requests
 from flask_cors import CORS
@@ -119,36 +123,142 @@ try:
     app.logger.info("FastMCP server instance created: %s", mcp_server.name)
 
     # --- Session Storage for Element IDs ---
-    # This stores element IDs from searches so they can be accurately referenced later
-    element_storage = {}  # Format: {"category_name": {"element_ids": [...], "count": N, "timestamp": "..."}}
-    
-    MAX_ELEMENTS_FOR_SELECTION = 250
+    # Keep full result sets server-side and return compact summaries to MCP clients.
+    element_storage = {}        # legacy/category lookup: {"windows": {...}}
+    result_handle_storage = {}  # primary lookup: {"res_xxxxx": {...}}
 
-    def store_elements(category_name: str, element_ids: list, count: int) -> str:
-        """Store element IDs for a category and return a storage key."""
+    MAX_ELEMENTS_FOR_SELECTION = 250
+    MAX_ELEMENTS_FOR_PROPERTY_READ = int(os.environ.get("REVITMCP_MAX_ELEMENTS_FOR_PROPERTY_READ", "300"))
+    DEFAULT_SERVER_FILTER_BATCH_SIZE = int(os.environ.get("REVITMCP_SERVER_FILTER_BATCH_SIZE", "600"))
+    MAX_ELEMENTS_IN_RESPONSE = int(os.environ.get("REVITMCP_MAX_ELEMENTS_IN_RESPONSE", "40"))
+    MAX_RECORDS_IN_RESPONSE = int(os.environ.get("REVITMCP_MAX_RECORDS_IN_RESPONSE", "20"))
+    MIN_CONFIDENCE_FOR_PARAMETER_REMAP = float(
+        os.environ.get("REVITMCP_MIN_CONFIDENCE_FOR_PARAMETER_REMAP", "0.82")
+    )
+
+    def _now_timestamp():
         import datetime
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        storage_key = category_name.lower().replace(" ", "_")
-        element_storage[storage_key] = {
-            "element_ids": element_ids,
-            "count": count,
+        return datetime.datetime.now().strftime("%H:%M:%S")
+
+    def _normalize_storage_key(name: str) -> str:
+        return str(name or "").lower().replace("ost_", "").replace(" ", "_")
+
+    def _new_result_handle() -> str:
+        return "res_{}".format(uuid.uuid4().hex[:12])
+
+    def store_elements(category_name: str, element_ids: list, count: int) -> tuple[str, str]:
+        """Store element IDs and return (storage_key, result_handle)."""
+        timestamp = _now_timestamp()
+        storage_key = _normalize_storage_key(category_name)
+        normalized_ids = [str(eid) for eid in (element_ids or [])]
+        result_handle = _new_result_handle()
+
+        record = {
+            "element_ids": normalized_ids,
+            "count": int(count if count is not None else len(normalized_ids)),
             "category": category_name,
-            "timestamp": timestamp
+            "timestamp": timestamp,
+            "storage_key": storage_key,
+            "result_handle": result_handle
         }
-        app.logger.info(f"Stored {count} element IDs for category '{category_name}' with key '{storage_key}'")
-        return storage_key
-    
+
+        element_storage[storage_key] = record
+        result_handle_storage[result_handle] = record
+        app.logger.info(
+            "Stored %s element IDs for category '%s' with key '%s' and handle '%s'",
+            record["count"], category_name, storage_key, result_handle
+        )
+        return storage_key, result_handle
+
+    def get_result_by_handle(result_handle: str) -> dict:
+        if not result_handle:
+            return None
+        return result_handle_storage.get(str(result_handle).strip())
+
     def get_stored_elements(storage_key: str) -> dict:
-        """Retrieve stored element IDs by storage key."""
-        storage_key = storage_key.lower().replace(" ", "_")
-        if storage_key in element_storage:
-            return element_storage[storage_key]
-        return None
-    
+        """Retrieve stored elements by category key or by result_handle."""
+        key = str(storage_key or "").strip()
+        if not key:
+            return None
+        if key.startswith("res_"):
+            return get_result_by_handle(key)
+        return element_storage.get(_normalize_storage_key(key))
+
     def list_stored_categories() -> dict:
-        """List all currently stored categories."""
-        return {key: {"category": data["category"], "count": data["count"], "timestamp": data["timestamp"]} 
-                for key, data in element_storage.items()}
+        """List all currently stored categories (compact metadata only)."""
+        return {
+            key: {
+                "category": data["category"],
+                "count": data["count"],
+                "timestamp": data["timestamp"],
+                "result_handle": data.get("result_handle")
+            }
+            for key, data in element_storage.items()
+        }
+
+    def resolve_element_ids(element_ids=None, result_handle: str = None, category_name: str = None):
+        """Resolve IDs from direct list, handle, or stored category key."""
+        if element_ids:
+            return [str(eid) for eid in element_ids], None, None
+
+        if result_handle:
+            record = get_result_by_handle(result_handle)
+            if not record:
+                return None, None, {"status": "error", "message": "Unknown result_handle '{}'".format(result_handle)}
+            return list(record.get("element_ids", [])), record, None
+
+        if category_name:
+            record = get_stored_elements(category_name)
+            if not record:
+                return None, None, {"status": "error", "message": "No stored elements found for '{}'".format(category_name)}
+            return list(record.get("element_ids", [])), record, None
+
+        return None, None, {"status": "error", "message": "No elements were provided. Use element_ids, result_handle, or category_name."}
+
+    def compact_result_payload(result: dict, preserve_keys: list = None) -> dict:
+        """Avoid sending huge arrays back through MCP responses."""
+        if not isinstance(result, dict):
+            return result
+
+        preserve_keys = preserve_keys or []
+        compact = dict(result)
+
+        if isinstance(compact.get("element_ids"), list):
+            ids = compact.get("element_ids", [])
+            if len(ids) > MAX_ELEMENTS_IN_RESPONSE:
+                compact["element_ids_sample"] = ids[:MAX_ELEMENTS_IN_RESPONSE]
+                compact["element_ids_truncated"] = True
+                compact["element_ids_total"] = len(ids)
+                compact.pop("element_ids", None)
+
+        if isinstance(compact.get("elements"), list):
+            records = compact.get("elements", [])
+            if len(records) > MAX_RECORDS_IN_RESPONSE:
+                compact["elements_sample"] = records[:MAX_RECORDS_IN_RESPONSE]
+                compact["elements_truncated"] = True
+                compact["elements_total"] = len(records)
+                compact.pop("elements", None)
+
+        if isinstance(compact.get("data"), dict):
+            data_dict = dict(compact["data"])
+            if isinstance(data_dict.get("selected_ids_processed"), list):
+                selected_ids = data_dict.get("selected_ids_processed", [])
+                if len(selected_ids) > MAX_ELEMENTS_IN_RESPONSE:
+                    data_dict["selected_ids_sample"] = selected_ids[:MAX_ELEMENTS_IN_RESPONSE]
+                    data_dict["selected_ids_truncated"] = True
+                    data_dict["selected_ids_total"] = len(selected_ids)
+                    data_dict.pop("selected_ids_processed", None)
+            compact["data"] = data_dict
+
+        if isinstance(compact.get("message"), str) and len(compact["message"]) > 1200:
+            compact["message"] = compact["message"][:1200] + "... [truncated]"
+            compact["message_truncated"] = True
+
+        for key in preserve_keys:
+            if key in result:
+                compact[key] = result[key]
+
+        return compact
 
     # --- Revit MCP API Communication ---
     # Auto-detect which port the Revit MCP API is running on
@@ -188,8 +298,11 @@ try:
     SELECT_STORED_ELEMENTS_TOOL_NAME = "select_stored_elements"
     LIST_STORED_ELEMENTS_TOOL_NAME = "list_stored_elements"
     FILTER_ELEMENTS_TOOL_NAME = "filter_elements"
+    FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME = "filter_stored_elements_by_parameter"
     GET_ELEMENT_PROPERTIES_TOOL_NAME = "get_element_properties"
     UPDATE_ELEMENT_PARAMETERS_TOOL_NAME = "update_element_parameters"
+    GET_SCHEMA_CONTEXT_TOOL_NAME = "get_revit_schema_context"
+    RESOLVE_TARGETS_TOOL_NAME = "resolve_revit_targets"
     
     # Sheet and view management tools
     PLACE_VIEW_ON_SHEET_TOOL_NAME = "place_view_on_sheet"
@@ -197,6 +310,11 @@ try:
 
     # Replace batch workflow with generic planner
     PLANNER_TOOL_NAME = "plan_and_execute_workflow"
+
+    schema_context_cache = {
+        "doc_fingerprint": None,
+        "context": None
+    }
 
     # --- Helper function to call Revit Listener (remains mostly the same) ---
     # This function is now central for all Revit interactions triggered by MCP tools.
@@ -306,6 +424,196 @@ try:
         text = " ".join(text_parts)
         return "RouteHandlerNotDefinedException" in text
 
+    def _normalize_label(value: str) -> str:
+        return re.sub(r'[^a-z0-9]+', '', str(value or "").lower())
+
+    def _best_match(term: str, candidates: list[str], fuzzy_cutoff: float = 0.5):
+        if not term or not candidates:
+            return None, [], 0.0
+        term = str(term).strip()
+        normalized_term = _normalize_label(term)
+        normalized_map = {}
+        for c in candidates:
+            normalized_map.setdefault(_normalize_label(c), []).append(c)
+
+        # Exact normalized match first
+        if normalized_term in normalized_map:
+            choice = normalized_map[normalized_term][0]
+            return choice, [], 1.0
+
+        # Substring heuristic
+        contains_matches = [c for c in candidates if normalized_term and normalized_term in _normalize_label(c)]
+        if contains_matches:
+            primary = contains_matches[0]
+            alternatives = contains_matches[1:6]
+            return primary, alternatives, 0.85
+
+        # Fuzzy fallback
+        fuzzy = difflib.get_close_matches(term, candidates, n=6, cutoff=fuzzy_cutoff)
+        if fuzzy:
+            primary = fuzzy[0]
+            alternatives = fuzzy[1:6]
+            score = difflib.SequenceMatcher(None, term.lower(), primary.lower()).ratio()
+            return primary, alternatives, score
+
+        return None, [], 0.0
+
+    def get_revit_schema_context_mcp_tool(force_refresh: bool = False) -> dict:
+        """Fetches canonical Revit schema context (categories, levels, families, types, parameters)."""
+        app.logger.info("MCP Tool executed: %s (force_refresh=%s)", GET_SCHEMA_CONTEXT_TOOL_NAME, force_refresh)
+
+        project_info = call_revit_listener(command_path='/project_info', method='GET')
+        if project_info.get("status") == "error":
+            return project_info
+
+        doc_fingerprint = "{}|{}|{}".format(
+            project_info.get("file_path", ""),
+            project_info.get("project_name", ""),
+            project_info.get("project_number", "")
+        )
+
+        if not force_refresh and schema_context_cache["context"] and schema_context_cache["doc_fingerprint"] == doc_fingerprint:
+            cached = dict(schema_context_cache["context"])
+            cached["cache"] = {"status": "hit", "doc_fingerprint": doc_fingerprint}
+            return cached
+
+        context_result = call_revit_listener(command_path='/schema/context', method='GET')
+        if context_result.get("status") == "error":
+            if _is_route_not_defined(context_result, "/schema/context"):
+                context_result["message"] = (
+                    "Route '/schema/context' is not available. Reload Revit to register new schema routes, "
+                    "or update extension files."
+                )
+            return context_result
+
+        schema_context_cache["doc_fingerprint"] = doc_fingerprint
+        schema_context_cache["context"] = context_result
+
+        result = dict(context_result)
+        result["cache"] = {"status": "refreshed", "doc_fingerprint": doc_fingerprint}
+        return compact_result_payload(result)
+
+    def _resolve_revit_targets_internal(query_terms: dict = None) -> dict:
+        context_result = get_revit_schema_context_mcp_tool(force_refresh=False)
+        if context_result.get("status") == "error":
+            return context_result
+
+        schema = context_result.get("schema", {})
+        built_in_categories = schema.get("built_in_categories", []) or []
+        document_categories = schema.get("document_categories", []) or []
+        levels = schema.get("levels", []) or []
+        family_names = schema.get("family_names", []) or []
+        type_names = schema.get("type_names", []) or []
+        parameter_names = schema.get("parameter_names", []) or []
+
+        query_terms = query_terms or {}
+        category_term = query_terms.get("category_name")
+        level_term = query_terms.get("level_name")
+        family_term = query_terms.get("family_name")
+        type_term = query_terms.get("type_name")
+        parameter_terms = query_terms.get("parameter_names", []) or []
+        if isinstance(parameter_terms, str):
+            parameter_terms = [parameter_terms]
+        elif not isinstance(parameter_terms, list):
+            parameter_terms = []
+
+        # Backward compatibility: accept singular parameter keys too.
+        for key in ("parameter_name", "parameter"):
+            legacy_term = query_terms.get(key)
+            if isinstance(legacy_term, str) and legacy_term.strip():
+                parameter_terms.append(legacy_term.strip())
+
+        # Preserve order, remove duplicates/empties.
+        seen_terms = set()
+        normalized_parameter_terms = []
+        for pterm in parameter_terms:
+            pterm_str = str(pterm).strip()
+            if not pterm_str:
+                continue
+            pkey = pterm_str.lower()
+            if pkey in seen_terms:
+                continue
+            seen_terms.add(pkey)
+            normalized_parameter_terms.append(pterm_str)
+        parameter_terms = normalized_parameter_terms
+
+        resolution = {"status": "success", "resolved": {}, "alternatives": {}, "confidence": {}, "context_doc": context_result.get("doc", {})}
+
+        if category_term:
+            category_candidates = list(set(document_categories + built_in_categories))
+            resolved_category, alternatives, confidence = _best_match(category_term, category_candidates)
+            if resolved_category:
+                # Favor OST_ names when they exist, but keep human names if that's what matched.
+                resolution["resolved"]["category_name"] = resolved_category
+                resolution["confidence"]["category_name"] = round(confidence, 3)
+                if alternatives:
+                    resolution["alternatives"]["category_name"] = alternatives
+            else:
+                resolution["status"] = "partial"
+                resolution["alternatives"]["category_name"] = category_candidates[:25]
+
+        if level_term:
+            resolved_level, alternatives, confidence = _best_match(level_term, levels)
+            if resolved_level:
+                resolution["resolved"]["level_name"] = resolved_level
+                resolution["confidence"]["level_name"] = round(confidence, 3)
+                if alternatives:
+                    resolution["alternatives"]["level_name"] = alternatives
+            else:
+                resolution["status"] = "partial"
+                resolution["alternatives"]["level_name"] = levels[:25]
+
+        if family_term:
+            resolved_family, alternatives, confidence = _best_match(family_term, family_names)
+            if resolved_family:
+                resolution["resolved"]["family_name"] = resolved_family
+                resolution["confidence"]["family_name"] = round(confidence, 3)
+                if alternatives:
+                    resolution["alternatives"]["family_name"] = alternatives
+            else:
+                resolution["status"] = "partial"
+                resolution["alternatives"]["family_name"] = family_names[:25]
+
+        if type_term:
+            resolved_type, alternatives, confidence = _best_match(type_term, type_names)
+            if resolved_type:
+                resolution["resolved"]["type_name"] = resolved_type
+                resolution["confidence"]["type_name"] = round(confidence, 3)
+                if alternatives:
+                    resolution["alternatives"]["type_name"] = alternatives
+            else:
+                resolution["status"] = "partial"
+                resolution["alternatives"]["type_name"] = type_names[:25]
+
+        if parameter_terms:
+            resolved_params = {}
+            unresolved_params = {}
+            for pname in parameter_terms:
+                resolved_param, alternatives, confidence = _best_match(
+                    pname,
+                    parameter_names,
+                    fuzzy_cutoff=max(0.5, MIN_CONFIDENCE_FOR_PARAMETER_REMAP)
+                )
+                if resolved_param and confidence >= MIN_CONFIDENCE_FOR_PARAMETER_REMAP:
+                    resolved_params[pname] = {"resolved_name": resolved_param, "confidence": round(confidence, 3)}
+                    if alternatives:
+                        unresolved_params[pname] = alternatives
+                else:
+                    resolution["status"] = "partial"
+                    unresolved_params[pname] = parameter_names[:25]
+            resolution["resolved"]["parameter_names"] = resolved_params
+            if unresolved_params:
+                resolution["alternatives"]["parameter_names"] = unresolved_params
+
+        return compact_result_payload(resolution)
+
+    def resolve_revit_targets_mcp_tool(query_terms: dict) -> dict:
+        """Resolves user-supplied names to exact Revit targets with confidence and alternatives."""
+        app.logger.info("MCP Tool executed: %s with query_terms=%s", RESOLVE_TARGETS_TOOL_NAME, query_terms)
+        if not isinstance(query_terms, dict):
+            return {"status": "error", "message": "query_terms must be an object."}
+        return _resolve_revit_targets_internal(query_terms)
+
     # --- MCP Tool Definitions using @mcp_server.tool() ---
     @mcp_server.tool(name=REVIT_INFO_TOOL_NAME) # Name must match what LLM will use
     def get_revit_project_info_mcp_tool() -> dict:
@@ -313,57 +621,101 @@ try:
         app.logger.info(f"MCP Tool executed: {REVIT_INFO_TOOL_NAME}")
         return call_revit_listener(command_path='/project_info', method='GET')
 
+    @mcp_server.tool(name=GET_SCHEMA_CONTEXT_TOOL_NAME)
+    def get_revit_schema_context_tool(force_refresh: bool = False) -> dict:
+        """Returns canonical Revit schema context (categories, levels, families, types, parameters)."""
+        return get_revit_schema_context_mcp_tool(force_refresh=force_refresh)
+
+    @mcp_server.tool(name=RESOLVE_TARGETS_TOOL_NAME)
+    def resolve_revit_targets_tool(query_terms: dict) -> dict:
+        """Resolves user terms to exact Revit category/level/family/type/parameter names with confidence."""
+        return resolve_revit_targets_mcp_tool(query_terms=query_terms)
+
     @mcp_server.tool(name=GET_ELEMENTS_BY_CATEGORY_TOOL_NAME)
     def get_elements_by_category_mcp_tool(category_name: str) -> dict:
         """Retrieves all elements in the Revit model belonging to the specified category, returning their IDs and names. Automatically stores the results for later selection."""
         app.logger.info(f"MCP Tool executed: {GET_ELEMENTS_BY_CATEGORY_TOOL_NAME} with category_name: {category_name}")
         result = call_revit_listener(command_path='/get_elements_by_category', method='POST', payload_data={"category_name": category_name})
+
+        if result.get("status") == "error" and "Invalid category_name" in str(result.get("message", "")):
+            suggestions = _resolve_revit_targets_internal({"category_name": category_name})
+            result["suggestions"] = suggestions
+            resolved_category = suggestions.get("resolved", {}).get("category_name")
+            if resolved_category:
+                result["message"] = "{} Did you mean '{}' ?".format(result.get("message", ""), resolved_category)
         
         # Automatically store the results if successful
         if result.get("status") == "success" and "element_ids" in result:
-            storage_key = store_elements(category_name, result["element_ids"], result.get("count", len(result["element_ids"])))
+            storage_key, result_handle = store_elements(category_name, result["element_ids"], result.get("count", len(result["element_ids"])))
             result["stored_as"] = storage_key
-            result["storage_message"] = f"Results stored as '{storage_key}' - use select_stored_elements to select these elements"
+            result["result_handle"] = result_handle
+            result["storage_message"] = f"Results stored as '{storage_key}' ({result_handle}) - use select_stored_elements with category_name or result_handle"
         
-        return result
+        return compact_result_payload(result, preserve_keys=["stored_as", "result_handle", "storage_message", "count", "category", "status", "message"])
 
     @mcp_server.tool(name=SELECT_ELEMENTS_TOOL_NAME)
-    def select_elements_by_id_mcp_tool(element_ids: list[str]) -> dict:
+    def select_elements_by_id_mcp_tool(element_ids: list[str] = None, result_handle: str = None) -> dict:
         """Selects one or more elements in Revit using their Element IDs."""
-        app.logger.info(f"MCP Tool executed: {SELECT_ELEMENTS_TOOL_NAME} with element_ids: {element_ids}")
+        app.logger.info(f"MCP Tool executed: {SELECT_ELEMENTS_TOOL_NAME}")
+
+        resolved_ids, record, resolve_error = resolve_element_ids(element_ids=element_ids, result_handle=result_handle)
+        if resolve_error:
+            return resolve_error
+
+        app.logger.info(
+            "select_elements_by_id_mcp_tool using %s IDs%s",
+            len(resolved_ids),
+            " from handle '{}'".format(result_handle) if result_handle else ""
+        )
         
         # Ensure element_ids is a list, even if a single string ID is passed by the LLM
-        if isinstance(element_ids, str):
-            app.logger.warning(f"select_elements_by_id_mcp_tool: element_ids was a string ('{element_ids}'), converting to list.")
-            processed_element_ids = [element_ids]
-        elif isinstance(element_ids, list) and all(isinstance(eid, str) for eid in element_ids):
-            processed_element_ids = element_ids
-        elif isinstance(element_ids, list): # List contains non-strings, attempt to convert or log error
-            app.logger.warning(f"select_elements_by_id_mcp_tool: element_ids list contained non-string items: {element_ids}. Attempting to convert all to strings.")
+        if isinstance(resolved_ids, str):
+            app.logger.warning(f"select_elements_by_id_mcp_tool: element_ids was a string ('{resolved_ids}'), converting to list.")
+            processed_element_ids = [resolved_ids]
+        elif isinstance(resolved_ids, list) and all(isinstance(eid, str) for eid in resolved_ids):
+            processed_element_ids = resolved_ids
+        elif isinstance(resolved_ids, list): # List contains non-strings, attempt to convert or log error
+            app.logger.warning(f"select_elements_by_id_mcp_tool: element_ids list contained non-string items: {resolved_ids}. Attempting to convert all to strings.")
             try:
-                processed_element_ids = [str(eid) for eid in element_ids]
+                processed_element_ids = [str(eid) for eid in resolved_ids]
             except Exception as e_conv:
                 app.logger.error(f"select_elements_by_id_mcp_tool: Failed to convert all items in element_ids to string: {e_conv}")
-                return {"status": "error", "message": f"Invalid format for element_ids. All IDs must be strings. Received: {element_ids}"}
+                return {"status": "error", "message": f"Invalid format for element_ids. All IDs must be strings. Received: {resolved_ids}"}
         else:
-            app.logger.error(f"select_elements_by_id_mcp_tool: element_ids is not a string or a list of strings. Received type: {type(element_ids)}, value: {element_ids}")
-            return {"status": "error", "message": f"Invalid input type for element_ids. Expected string or list of strings. Received: {type(element_ids)}"}
+            app.logger.error(f"select_elements_by_id_mcp_tool: element_ids is not a string or a list of strings. Received type: {type(resolved_ids)}, value: {resolved_ids}")
+            return {"status": "error", "message": f"Invalid input type for element_ids. Expected string or list of strings. Received: {type(resolved_ids)}"}
 
-        return call_revit_listener(command_path='/select_elements_by_id', method='POST', payload_data={"element_ids": processed_element_ids})
+        result = call_revit_listener(command_path='/select_elements_by_id', method='POST', payload_data={"element_ids": processed_element_ids})
+        if result.get("status") == "success" and result_handle:
+            result["result_handle"] = result_handle
+        return compact_result_payload(result)
 
     @mcp_server.tool(name=SELECT_STORED_ELEMENTS_TOOL_NAME)
-    def select_stored_elements_mcp_tool(category_name: str) -> dict:
+    def select_stored_elements_mcp_tool(category_name: str = None, result_handle: str = None) -> dict:
         """Selects elements that were previously retrieved and stored by get_elements_by_category or filter_elements. Use the category name (e.g., 'windows', 'doors') to select the stored elements."""
-        app.logger.info(f"MCP Tool executed: {SELECT_STORED_ELEMENTS_TOOL_NAME} with category_name: {category_name}")
+        app.logger.info(f"MCP Tool executed: {SELECT_STORED_ELEMENTS_TOOL_NAME} with category_name: {category_name}, result_handle: {result_handle}")
         
-        # Normalize the input category name
-        normalized_category = category_name.lower().replace("ost_", "").replace(" ", "_")
-        
-        # Strategy 1: Try exact match first
-        stored_data = get_stored_elements(normalized_category)
+        stored_data = None
+        normalized_category = None
+        if result_handle:
+            stored_data = get_result_by_handle(result_handle)
+            if not stored_data:
+                return {
+                    "status": "error",
+                    "message": f"No stored elements found for result_handle '{result_handle}'.",
+                    "available_categories": list(element_storage.keys())
+                }
+            normalized_category = stored_data.get("storage_key", stored_data.get("category", "unknown"))
+        elif category_name:
+            # Normalize the input category name
+            normalized_category = category_name.lower().replace("ost_", "").replace(" ", "_")
+            # Strategy 1: Try exact match first
+            stored_data = get_stored_elements(normalized_category)
+        else:
+            return {"status": "error", "message": "Provide either category_name or result_handle."}
         
         # Strategy 2: If exact match fails, try to find partial matches
-        if not stored_data:
+        if not stored_data and category_name:
             available_keys = list(element_storage.keys())
             
             # Look for keys that start with the category name (e.g., "windows" matching "windows_level_l5")
@@ -386,7 +738,7 @@ try:
             available_keys = list(element_storage.keys())
             return {
                 "status": "error", 
-                "message": f"No stored elements found for category '{category_name}'. Available stored categories: {available_keys}",
+                "message": f"No stored elements found for category '{category_name or result_handle}'. Available stored categories: {available_keys}",
                 "available_categories": available_keys,
                 "suggestion": "Try using list_stored_elements to see all available categories, or use the exact storage key name."
             }
@@ -426,13 +778,14 @@ try:
 
         # Add storage info to the result
         if result.get("status") == "success":
-            result["source"] = f"stored_{category_name}"
+            result["source"] = f"stored_{category_name or normalized_category}"
             result["stored_count"] = stored_data["count"]
             result["stored_at"] = stored_data["timestamp"]
             result["matched_key"] = stored_data.get("category", "unknown")
+            result["result_handle"] = stored_data.get("result_handle")
             result["approach_note"] = "Focused selection - elements should remain active for user operations"
 
-        return result
+        return compact_result_payload(result)
 
     @mcp_server.tool(name=LIST_STORED_ELEMENTS_TOOL_NAME)
     def list_stored_elements_mcp_tool() -> dict:
@@ -452,6 +805,32 @@ try:
     def filter_elements_mcp_tool(category_name: str, level_name: str = None, parameters: list = None) -> dict:
         """Filters elements by category, level, and parameter conditions. Returns element IDs matching the criteria. Use this instead of get_elements_by_category when you need specific filtering."""
         app.logger.info(f"MCP Tool executed: {FILTER_ELEMENTS_TOOL_NAME} with category: {category_name}, level: {level_name}, parameters: {parameters}")
+
+        resolution = _resolve_revit_targets_internal({
+            "category_name": category_name,
+            "level_name": level_name,
+            "parameter_names": [p.get("name") for p in (parameters or []) if isinstance(p, dict) and p.get("name")]
+        })
+        if resolution.get("status") != "error":
+            resolved_payload = resolution.get("resolved", {})
+            if resolved_payload.get("category_name"):
+                category_name = resolved_payload["category_name"]
+            if resolved_payload.get("level_name"):
+                level_name = resolved_payload["level_name"]
+            param_map = resolved_payload.get("parameter_names", {})
+            if param_map and isinstance(parameters, list):
+                for p in parameters:
+                    if isinstance(p, dict) and p.get("name") in param_map:
+                        mapped = param_map[p["name"]]
+                        resolved_name = mapped.get("resolved_name", p["name"])
+                        confidence = float(mapped.get("confidence", 0.0))
+                        if confidence >= MIN_CONFIDENCE_FOR_PARAMETER_REMAP:
+                            p["name"] = resolved_name
+                        else:
+                            app.logger.info(
+                                "Skipping low-confidence parameter remap for '%s' -> '%s' (confidence=%s)",
+                                p["name"], resolved_name, confidence
+                            )
         
         payload = {"category_name": category_name}
         if level_name:
@@ -460,6 +839,31 @@ try:
             payload["parameters"] = parameters
         
         result = call_revit_listener(command_path='/elements/filter', method='POST', payload_data=payload)
+
+        if result.get("status") == "error":
+            error_msg = str(result.get("message", ""))
+            if "Invalid category_name" in error_msg or "Level '" in error_msg:
+                resolver_input = {
+                    "category_name": category_name,
+                    "level_name": level_name,
+                    "parameter_names": [p.get("name") for p in (parameters or []) if isinstance(p, dict) and p.get("name")]
+                }
+                suggestions = _resolve_revit_targets_internal(resolver_input)
+                result["suggestions"] = suggestions
+                if "Invalid category_name" in error_msg:
+                    resolved_category = suggestions.get("resolved", {}).get("category_name")
+                    alt_categories = suggestions.get("alternatives", {}).get("category_name", [])
+                    if resolved_category:
+                        result["message"] = "{} Did you mean '{}' ?".format(error_msg, resolved_category)
+                    elif alt_categories:
+                        result["message"] = "{} Available categories include: {}".format(error_msg, ", ".join(alt_categories[:10]))
+                if "Level '" in error_msg:
+                    resolved_level = suggestions.get("resolved", {}).get("level_name")
+                    alt_levels = suggestions.get("alternatives", {}).get("level_name", [])
+                    if resolved_level:
+                        result["message"] = "{} Did you mean level '{}' ?".format(result.get("message", error_msg), resolved_level)
+                    elif alt_levels:
+                        result["message"] = "{} Available levels include: {}".format(result.get("message", error_msg), ", ".join(alt_levels[:10]))
 
         if result.get("status") == "error" and _is_route_not_defined(result, "/elements/filter"):
             # Compatibility fallback: if no advanced filters were requested, use category retrieval.
@@ -486,20 +890,197 @@ try:
             if parameters:
                 storage_key += "_filtered"
             
-            stored_key = store_elements(storage_key, result["element_ids"], result.get("count", len(result["element_ids"])))
+            stored_key, result_handle = store_elements(storage_key, result["element_ids"], result.get("count", len(result["element_ids"])))
             result["stored_as"] = stored_key
-            result["storage_message"] = f"Filtered results stored as '{stored_key}' - use select_stored_elements to select these elements"
+            result["result_handle"] = result_handle
+            result["storage_message"] = f"Filtered results stored as '{stored_key}' ({result_handle}) - use select_stored_elements with category_name or result_handle"
         
-        return result
+        return compact_result_payload(result, preserve_keys=["stored_as", "result_handle", "storage_message", "count", "category", "status", "message"])
+
+    def _matches_filter_value(candidate_value, expected_value, operator="contains", case_sensitive=False):
+        candidate = "" if candidate_value in (None, "Not available") else str(candidate_value)
+        expected = "" if expected_value is None else str(expected_value)
+        op = str(operator or "contains").strip().lower()
+
+        if not case_sensitive:
+            candidate_cmp = candidate.lower()
+            expected_cmp = expected.lower()
+        else:
+            candidate_cmp = candidate
+            expected_cmp = expected
+
+        if op in ("contains",):
+            return expected_cmp in candidate_cmp
+        if op in ("equals", "=="):
+            return candidate_cmp == expected_cmp
+        if op in ("not_equals", "!=", "not equal"):
+            return candidate_cmp != expected_cmp
+        if op in ("starts_with",):
+            return candidate_cmp.startswith(expected_cmp)
+        if op in ("ends_with",):
+            return candidate_cmp.endswith(expected_cmp)
+        return False
+
+    @mcp_server.tool(name=FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME)
+    def filter_stored_elements_by_parameter_mcp_tool(
+        parameter_name: str,
+        value: str,
+        operator: str = "contains",
+        result_handle: str = None,
+        category_name: str = None,
+        batch_size: int = None,
+        case_sensitive: bool = False
+    ) -> dict:
+        """
+        Server-side batch filter across a stored element set by parameter value.
+        This keeps large element/property scans out of LLM context.
+        """
+        app.logger.info(
+            "MCP Tool executed: %s (parameter=%s, operator=%s, value=%s, result_handle=%s, category_name=%s, batch_size=%s)",
+            FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME,
+            parameter_name,
+            operator,
+            value,
+            result_handle,
+            category_name,
+            batch_size
+        )
+
+        if not parameter_name or value is None:
+            return {"status": "error", "message": "parameter_name and value are required."}
+
+        parameter_resolution = _resolve_revit_targets_internal({"parameter_names": [parameter_name]})
+        param_map = parameter_resolution.get("resolved", {}).get("parameter_names", {})
+        if parameter_name in param_map:
+            mapped = param_map[parameter_name]
+            confidence = float(mapped.get("confidence", 0.0))
+            if confidence >= MIN_CONFIDENCE_FOR_PARAMETER_REMAP:
+                parameter_name = mapped.get("resolved_name", parameter_name)
+
+        resolved_ids, record, resolve_error = resolve_element_ids(
+            element_ids=None,
+            result_handle=result_handle,
+            category_name=category_name
+        )
+        if resolve_error:
+            return resolve_error
+
+        total_ids = len(resolved_ids)
+        if total_ids == 0:
+            return {"status": "success", "count": 0, "message": "No source elements available for server-side filtering."}
+
+        if batch_size is None:
+            # Larger defaults for very large sets reduce per-request overhead.
+            inferred_batch_size = 1000 if total_ids >= 5000 else DEFAULT_SERVER_FILTER_BATCH_SIZE
+        else:
+            inferred_batch_size = int(batch_size)
+
+        safe_batch_size = int(inferred_batch_size)
+        safe_batch_size = max(20, min(1000, safe_batch_size))
+        total_batches = int((total_ids + safe_batch_size - 1) / safe_batch_size)
+
+        matched_ids = []
+        matched_samples = []
+
+        for batch_index, start in enumerate(range(0, total_ids, safe_batch_size), 1):
+            batch_ids = resolved_ids[start:start + safe_batch_size]
+            batch_result = call_revit_listener(
+                command_path='/elements/get_properties',
+                method='POST',
+                payload_data={
+                    "element_ids": batch_ids,
+                    "parameter_names": [parameter_name]
+                }
+            )
+
+            if batch_result.get("status") == "error":
+                if _is_route_not_defined(batch_result, "/elements/get_properties"):
+                    return {
+                        "status": "error",
+                        "error_type": "route_not_defined",
+                        "message": "The active Revit route set does not support '/elements/get_properties'. Reload/update the Revit extension to enable server-side filtering."
+                    }
+                return batch_result
+
+            elements = batch_result.get("elements", []) or []
+            for element_data in elements:
+                element_id = str(element_data.get("element_id", "")).strip()
+                properties = element_data.get("properties", {}) or {}
+                current_value = properties.get(parameter_name, "Not available")
+                if _matches_filter_value(current_value, value, operator=operator, case_sensitive=case_sensitive):
+                    matched_ids.append(element_id)
+                    if len(matched_samples) < MAX_RECORDS_IN_RESPONSE:
+                        matched_samples.append({"element_id": element_id, parameter_name: current_value})
+
+            if batch_index == 1 or batch_index % 5 == 0 or batch_index == total_batches:
+                app.logger.info(
+                    "Server-side filter progress: batch %s/%s, processed=%s/%s, matched=%s",
+                    batch_index,
+                    total_batches,
+                    min(start + len(batch_ids), total_ids),
+                    total_ids,
+                    len(matched_ids)
+                )
+
+        source_key = record.get("storage_key") if isinstance(record, dict) else _normalize_storage_key(category_name or "elements")
+        parameter_key = _normalize_storage_key(parameter_name)
+        filtered_storage_seed = "{}_{}_filtered".format(source_key, parameter_key)
+        stored_key, new_result_handle = store_elements(filtered_storage_seed, matched_ids, len(matched_ids))
+
+        result = {
+            "status": "success",
+            "count": len(matched_ids),
+            "source_count": total_ids,
+            "processed_count": total_ids,
+            "parameter_name": parameter_name,
+            "operator": operator,
+            "value": str(value),
+            "case_sensitive": bool(case_sensitive),
+            "matched_sample": matched_samples,
+            "element_ids": matched_ids,
+            "stored_as": stored_key,
+            "result_handle": new_result_handle,
+            "storage_message": "Filtered results stored as '{}' ({}) - use select_stored_elements with result_handle".format(stored_key, new_result_handle),
+            "message": "Server-side parameter filtering matched {} of {} source elements.".format(len(matched_ids), total_ids)
+        }
+        return compact_result_payload(
+            result,
+            preserve_keys=["stored_as", "result_handle", "storage_message", "count", "source_count", "processed_count", "status", "message", "parameter_name", "operator", "value"]
+        )
 
     @mcp_server.tool(name=GET_ELEMENT_PROPERTIES_TOOL_NAME)
-    def get_element_properties_mcp_tool(element_ids: list[str], parameter_names: list[str] = None) -> dict:
+    def get_element_properties_mcp_tool(
+        element_ids: list[str] = None,
+        parameter_names: list[str] = None,
+        result_handle: str = None,
+        include_all_parameters: bool = False,
+        populated_only: bool = False
+    ) -> dict:
         """Gets parameter values for specified elements. If parameter_names not provided, returns common parameters for the element category."""
-        app.logger.info(f"MCP Tool executed: {GET_ELEMENT_PROPERTIES_TOOL_NAME} with {len(element_ids)} elements")
+        resolved_ids, record, resolve_error = resolve_element_ids(element_ids=element_ids, result_handle=result_handle)
+        if resolve_error:
+            return resolve_error
+        requested_count = len(resolved_ids)
+        truncated_for_safety = False
+        if requested_count > MAX_ELEMENTS_FOR_PROPERTY_READ:
+            resolved_ids = resolved_ids[:MAX_ELEMENTS_FOR_PROPERTY_READ]
+            truncated_for_safety = True
+            app.logger.warning(
+                "%s requested %s elements; limiting property read to first %s for safety",
+                GET_ELEMENT_PROPERTIES_TOOL_NAME,
+                requested_count,
+                MAX_ELEMENTS_FOR_PROPERTY_READ
+            )
+
+        app.logger.info(f"MCP Tool executed: {GET_ELEMENT_PROPERTIES_TOOL_NAME} with {len(resolved_ids)} elements")
         
-        payload = {"element_ids": element_ids}
+        payload = {"element_ids": resolved_ids}
         if parameter_names:
             payload["parameter_names"] = parameter_names
+        if include_all_parameters:
+            payload["include_all_parameters"] = True
+        if populated_only:
+            payload["populated_only"] = True
         
         result = call_revit_listener(command_path='/elements/get_properties', method='POST', payload_data=payload)
         if result.get("status") == "error" and _is_route_not_defined(result, "/elements/get_properties"):
@@ -508,12 +1089,23 @@ try:
                 "error_type": "route_not_defined",
                 "message": "The active Revit route set does not support '/elements/get_properties'. Reload/update the Revit extension to enable property reads."
             }
-        return result
+        if result.get("status") == "success" and result_handle:
+            result["result_handle"] = result_handle
+        if result.get("status") == "success" and truncated_for_safety:
+            result["requested_count"] = requested_count
+            result["processed_count"] = len(resolved_ids)
+            result["truncated_for_safety"] = True
+            result["message"] = (
+                "Retrieved properties for {} elements (safety-capped from {}). "
+                "Narrow with filter_elements for full-accuracy bulk analysis."
+            ).format(len(resolved_ids), requested_count)
+        return compact_result_payload(result)
 
     @mcp_server.tool(name=UPDATE_ELEMENT_PARAMETERS_TOOL_NAME)
     def update_element_parameters_mcp_tool(
         updates: list[dict] = None,
         element_ids: list[str] = None,
+        result_handle: str = None,
         parameter_name: str = None,
         new_value: str = None
     ) -> dict:
@@ -537,14 +1129,17 @@ try:
                     return {"status": "error", "message": "'parameters' must be a non-empty object of parameter/value pairs."}
                 normalized_updates.append({"element_id": element_id, "parameters": parameters})
 
-        elif element_ids and parameter_name and new_value is not None:
-            if not isinstance(element_ids, list) or not element_ids:
+        elif (element_ids or result_handle) and parameter_name and new_value is not None:
+            resolved_ids, record, resolve_error = resolve_element_ids(element_ids=element_ids, result_handle=result_handle)
+            if resolve_error:
+                return resolve_error
+            if not isinstance(resolved_ids, list) or not resolved_ids:
                 return {"status": "error", "message": "'element_ids' must be a non-empty list when using the simplified form."}
             parameter_name = str(parameter_name).strip()
             if not parameter_name:
                 return {"status": "error", "message": "parameter_name cannot be empty."}
             normalized_value = str(new_value)
-            for eid in element_ids:
+            for eid in resolved_ids:
                 element_id = str(eid).strip()
                 if not element_id:
                     return {"status": "error", "message": "All element_ids must be non-empty strings."}
@@ -553,6 +1148,18 @@ try:
             return {"status": "error", "message": "Provide either 'updates' or (element_ids, parameter_name, new_value)."}
 
         app.logger.info(f"Prepared {len(normalized_updates)} parameter update(s) for execution.")
+
+        # Resolve parameter names for simplified bulk form.
+        if parameter_name:
+            parameter_resolution = _resolve_revit_targets_internal({
+                "parameter_names": [parameter_name]
+            })
+            param_map = parameter_resolution.get("resolved", {}).get("parameter_names", {})
+            if parameter_name in param_map:
+                mapped = param_map[parameter_name]
+                confidence = float(mapped.get("confidence", 0.0))
+                if confidence >= MIN_CONFIDENCE_FOR_PARAMETER_REMAP:
+                    parameter_name = mapped.get("resolved_name", parameter_name)
 
         result = call_revit_listener(
             command_path='/elements/update_parameters',
@@ -565,7 +1172,9 @@ try:
                 "error_type": "route_not_defined",
                 "message": "The active Revit route set does not support '/elements/update_parameters'. Reload/update the Revit extension to enable parameter updates."
             }
-        return result
+        if result.get("status") == "success" and result_handle:
+            result["result_handle"] = result_handle
+        return compact_result_payload(result)
 
     
     @mcp_server.tool(name=PLACE_VIEW_ON_SHEET_TOOL_NAME)
@@ -609,27 +1218,44 @@ try:
         # Available tool mapping
         available_tools = {
             "get_revit_project_info": get_revit_project_info_mcp_tool,
+            "get_revit_schema_context": lambda **kwargs: get_revit_schema_context_tool(kwargs.get("force_refresh", False)),
+            "resolve_revit_targets": lambda **kwargs: resolve_revit_targets_tool(kwargs.get("query_terms", {})),
             "get_elements_by_category": lambda **kwargs: get_elements_by_category_mcp_tool(kwargs.get("category_name")),
             "filter_elements": lambda **kwargs: filter_elements_mcp_tool(
                 kwargs.get("category_name"), 
                 kwargs.get("level_name"), 
                 kwargs.get("parameters", [])
             ),
+            "filter_stored_elements_by_parameter": lambda **kwargs: filter_stored_elements_by_parameter_mcp_tool(
+                parameter_name=kwargs.get("parameter_name"),
+                value=kwargs.get("value"),
+                operator=kwargs.get("operator", "contains"),
+                result_handle=kwargs.get("result_handle"),
+                category_name=kwargs.get("category_name"),
+                batch_size=kwargs.get("batch_size"),
+                case_sensitive=kwargs.get("case_sensitive", False)
+            ),
             "get_element_properties": lambda **kwargs: get_element_properties_mcp_tool(
-                kwargs.get("element_ids", []), 
-                kwargs.get("parameter_names", [])
+                kwargs.get("element_ids", []),
+                kwargs.get("parameter_names", []),
+                kwargs.get("result_handle"),
+                kwargs.get("include_all_parameters", False),
+                kwargs.get("populated_only", False)
             ),
             "update_element_parameters": lambda **kwargs: update_element_parameters_mcp_tool(
                 updates=kwargs.get("updates"),
                 element_ids=kwargs.get("element_ids"),
+                result_handle=kwargs.get("result_handle"),
                 parameter_name=kwargs.get("parameter_name"),
                 new_value=kwargs.get("new_value")
             ),
             "select_elements_by_id": lambda **kwargs: select_elements_by_id_mcp_tool(
-                kwargs.get("element_ids", [])
+                kwargs.get("element_ids", []),
+                kwargs.get("result_handle")
             ),
             "select_stored_elements": lambda **kwargs: select_stored_elements_mcp_tool(
-                kwargs.get("category_name")
+                kwargs.get("category_name"),
+                kwargs.get("result_handle")
             ),
             "list_stored_elements": list_stored_elements_mcp_tool,
             "place_view_on_sheet": lambda **kwargs: place_view_on_sheet_mcp_tool(
@@ -694,6 +1320,83 @@ try:
                 
                 # Apply substitution to all parameters
                 tool_params = substitute_placeholders(tool_params)
+
+                # Enforce resolver-first behavior for filter/update operations
+                if tool_name in ["filter_elements", "update_element_parameters", "filter_stored_elements_by_parameter"]:
+                    resolver_input = {}
+                    if tool_name == "filter_elements":
+                        resolver_input["category_name"] = tool_params.get("category_name")
+                        resolver_input["level_name"] = tool_params.get("level_name")
+                        resolver_input["parameter_names"] = [
+                            p.get("name") for p in (tool_params.get("parameters", []) or [])
+                            if isinstance(p, dict) and p.get("name")
+                        ]
+                    elif tool_name == "filter_stored_elements_by_parameter":
+                        resolver_input["parameter_names"] = [tool_params.get("parameter_name")]
+                    elif tool_name == "update_element_parameters":
+                        parameter_candidates = []
+                        if tool_params.get("parameter_name"):
+                            parameter_candidates.append(tool_params.get("parameter_name"))
+                        if isinstance(tool_params.get("updates"), list):
+                            for upd in tool_params.get("updates"):
+                                if isinstance(upd, dict) and isinstance(upd.get("parameters"), dict):
+                                    parameter_candidates.extend(list(upd.get("parameters").keys()))
+                        resolver_input["parameter_names"] = list(set(parameter_candidates))
+
+                    resolution = _resolve_revit_targets_internal(resolver_input)
+                    step_info["resolution"] = resolution
+                    if resolution.get("status") == "error":
+                        step_info["status"] = "error"
+                        step_info["error"] = "Target resolution failed before executing '{}'".format(tool_name)
+                        step_info["result"] = resolution
+                        workflow_results["executed_steps"].append(step_info)
+                        workflow_results["step_results"].append(step_info["result"])
+                        continue
+
+                    resolved_payload = resolution.get("resolved", {})
+                    if tool_name == "filter_elements":
+                        if resolved_payload.get("category_name"):
+                            tool_params["category_name"] = resolved_payload["category_name"]
+                        if resolved_payload.get("level_name"):
+                            tool_params["level_name"] = resolved_payload["level_name"]
+                        param_map = resolved_payload.get("parameter_names", {})
+                        if param_map and isinstance(tool_params.get("parameters"), list):
+                            for p in tool_params["parameters"]:
+                                if isinstance(p, dict) and p.get("name") in param_map:
+                                    mapped = param_map[p["name"]]
+                                    confidence = float(mapped.get("confidence", 0.0))
+                                    if confidence >= MIN_CONFIDENCE_FOR_PARAMETER_REMAP:
+                                        p["name"] = mapped.get("resolved_name", p["name"])
+                    elif tool_name == "filter_stored_elements_by_parameter":
+                        param_map = resolved_payload.get("parameter_names", {})
+                        current_param = tool_params.get("parameter_name")
+                        if current_param in param_map:
+                            mapped = param_map[current_param]
+                            confidence = float(mapped.get("confidence", 0.0))
+                            if confidence >= MIN_CONFIDENCE_FOR_PARAMETER_REMAP:
+                                tool_params["parameter_name"] = mapped.get("resolved_name", current_param)
+                    elif tool_name == "update_element_parameters":
+                        param_map = resolved_payload.get("parameter_names", {})
+                        if tool_params.get("parameter_name") in param_map:
+                            mapped = param_map[tool_params["parameter_name"]]
+                            confidence = float(mapped.get("confidence", 0.0))
+                            if confidence >= MIN_CONFIDENCE_FOR_PARAMETER_REMAP:
+                                tool_params["parameter_name"] = mapped.get("resolved_name", tool_params["parameter_name"])
+                        if isinstance(tool_params.get("updates"), list):
+                            for upd in tool_params["updates"]:
+                                if isinstance(upd, dict) and isinstance(upd.get("parameters"), dict):
+                                    new_params = {}
+                                    for k, v in upd["parameters"].items():
+                                        if k in param_map:
+                                            mapped = param_map[k]
+                                            confidence = float(mapped.get("confidence", 0.0))
+                                            if confidence >= MIN_CONFIDENCE_FOR_PARAMETER_REMAP:
+                                                new_params[mapped.get("resolved_name", k)] = v
+                                            else:
+                                                new_params[k] = v
+                                        else:
+                                            new_params[k] = v
+                                    upd["parameters"] = new_params
                 
                 app.logger.info(f"Executing step {i}: {tool_name} - {step.get('description', '')}")
                 app.logger.debug(f"Step {i} parameters after substitution: {tool_params}")
@@ -728,11 +1431,15 @@ try:
                         
                         # Store results for potential use in subsequent steps
                         # This allows chaining where one step's output feeds into the next
-                        if "element_ids" in result:
+                        if isinstance(result, dict) and "result_handle" in result:
+                            workflow_results[f"step_{i}_result_handle"] = result["result_handle"]
+                        if isinstance(result, dict) and "element_ids" in result:
                             workflow_results[f"step_{i}_element_ids"] = result["element_ids"]
-                        if "count" in result:
+                        if isinstance(result, dict) and "element_ids_sample" in result:
+                            workflow_results[f"step_{i}_element_ids_sample"] = result["element_ids_sample"]
+                        if isinstance(result, dict) and "count" in result:
                             workflow_results[f"step_{i}_count"] = result["count"]
-                        if "elements" in result:
+                        if isinstance(result, dict) and "elements" in result:
                             workflow_results[f"step_{i}_elements"] = result["elements"]
                         
                     except Exception as tool_error:
@@ -774,17 +1481,49 @@ try:
     # These definitions tell the LLMs (OpenAI, Anthropic, Google) about the tools.
     # The 'name' in these specs MUST match the 'name' in @mcp_server.tool() and the constants.
     REVIT_INFO_TOOL_DESCRIPTION_FOR_LLM = "Retrieves detailed information about the currently open Revit project, such as project name, file path, Revit version, Revit build number, and active document title."
+    GET_SCHEMA_CONTEXT_TOOL_DESCRIPTION_FOR_LLM = "Returns canonical Revit schema context (exact levels, category names, family/type names, common parameter names). Use this before filtering or parameter updates."
+    GET_SCHEMA_CONTEXT_TOOL_PARAMETERS_FOR_LLM = {
+        "type": "object",
+        "properties": {
+            "force_refresh": {"type": "boolean", "description": "If true, refresh schema context from Revit even if cached."}
+        }
+    }
+    RESOLVE_TARGETS_TOOL_DESCRIPTION_FOR_LLM = "Resolves user terms (category/level/family/type/parameter names) to exact Revit names with confidence and alternatives. Always call this before filter_elements or update_element_parameters."
+    RESOLVE_TARGETS_TOOL_PARAMETERS_FOR_LLM = {
+        "type": "object",
+        "properties": {
+            "query_terms": {
+                "type": "object",
+                "properties": {
+                    "category_name": {"type": "string"},
+                    "level_name": {"type": "string"},
+                    "family_name": {"type": "string"},
+                    "type_name": {"type": "string"},
+                    "parameter_names": {"type": "array", "items": {"type": "string"}}
+                }
+            }
+        },
+        "required": ["query_terms"]
+    }
     GET_ELEMENTS_BY_CATEGORY_TOOL_DESCRIPTION_FOR_LLM = "Retrieves and stores all elements in the current Revit model for the specified category. Use this ONLY when the user wants to find/get elements. This automatically stores results for later selection. After calling this, if the user wants to select the elements, use select_stored_elements."
     GET_ELEMENTS_BY_CATEGORY_TOOL_PARAMETERS_FOR_LLM = {
         "type": "object", "properties": {"category_name": {"type": "string", "description": "The name of the Revit category to retrieve elements from (e.g., 'OST_Windows', 'OST_Doors', 'OST_Walls' or simplified like 'Windows', 'Doors', 'Walls')."}}, "required": ["category_name"]
     }
-    SELECT_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM = "DEPRECATED - Use select_stored_elements instead. Selects elements by exact IDs. Only use this if you have specific element IDs that are NOT from get_elements_by_category."
+    SELECT_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM = "DEPRECATED - Prefer select_stored_elements. Selects elements by exact IDs or by a stored result_handle."
     SELECT_ELEMENTS_TOOL_PARAMETERS_FOR_LLM = {
-        "type": "object", "properties": {"element_ids": {"type": "array", "items": {"type": "string"}, "description": "An array of Element IDs (as strings) of the Revit elements to be selected."}}, "required": ["element_ids"]
+        "type": "object",
+        "properties": {
+            "element_ids": {"type": "array", "items": {"type": "string"}, "description": "Array of Element IDs to select. Avoid large lists when possible."},
+            "result_handle": {"type": "string", "description": "Handle from get_elements_by_category/filter_elements to select without passing all IDs."}
+        }
     }
-    SELECT_STORED_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM = "Selects elements that were previously retrieved by get_elements_by_category. Use this when the user wants to SELECT elements after using get_elements_by_category. When user says 'select windows', 'select doors', 'select them', etc., use this tool with the category name. Automatically zooms to show selected elements without changing the user's view."
+    SELECT_STORED_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM = "Selects elements previously retrieved by get_elements_by_category or filter_elements. Prefer using result_handle to avoid passing large element lists."
     SELECT_STORED_ELEMENTS_TOOL_PARAMETERS_FOR_LLM = {
-        "type": "object", "properties": {"category_name": {"type": "string", "description": "The category name of the stored elements to select (e.g., 'windows', 'doors', 'walls'). Use the same category name that was used with get_elements_by_category."}}, "required": ["category_name"]
+        "type": "object",
+        "properties": {
+            "category_name": {"type": "string", "description": "Stored category key (e.g., 'windows', 'doors')."},
+            "result_handle": {"type": "string", "description": "Preferred. Handle returned by get_elements_by_category/filter_elements."}
+        }
     }
     LIST_STORED_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM = "Lists all currently stored element categories and their counts. Use this to see what elements are available for selection using select_stored_elements."
     LIST_STORED_ELEMENTS_TOOL_PARAMETERS_FOR_LLM = {
@@ -812,16 +1551,37 @@ try:
         }, 
         "required": ["category_name"]
     }
-    GET_ELEMENT_PROPERTIES_TOOL_DESCRIPTION_FOR_LLM = "Gets parameter values for specified elements. Use this to read current values before updating or to display element properties to the user. IMPORTANT: This is typically used as a middle step - after filtering elements and before updating them. When user requests updates, chain: filter -> get_properties -> update_parameters in one turn."
+    FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_DESCRIPTION_FOR_LLM = "Filters a previously stored element set using server-side batched parameter reads. Use this after get_elements_by_category/filter_elements to avoid loading large property datasets into model context."
+    FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_PARAMETERS_FOR_LLM = {
+        "type": "object",
+        "properties": {
+            "result_handle": {"type": "string", "description": "Preferred. Source handle returned by get_elements_by_category/filter_elements."},
+            "category_name": {"type": "string", "description": "Alternative to result_handle. Stored category key."},
+            "parameter_name": {"type": "string", "description": "Exact parameter name to evaluate (e.g., 'Part Number')."},
+            "value": {"type": "string", "description": "Value to compare against."},
+            "operator": {
+                "type": "string",
+                "enum": ["contains", "equals", "not_equals", "starts_with", "ends_with"],
+                "description": "Comparison operator. Default is 'contains'."
+            },
+            "batch_size": {"type": "integer", "description": "Optional server-side batch size (20-1000)."},
+            "case_sensitive": {"type": "boolean", "description": "Whether string matching is case-sensitive. Default false."}
+        },
+        "required": ["parameter_name", "value"]
+    }
+    GET_ELEMENT_PROPERTIES_TOOL_DESCRIPTION_FOR_LLM = "Gets parameter values for specified elements. Prefer result_handle over raw element_ids for large result sets. Use include_all_parameters=true with populated_only=true to discover which parameters actually have values."
     GET_ELEMENT_PROPERTIES_TOOL_PARAMETERS_FOR_LLM = {
         "type": "object",
         "properties": {
-            "element_ids": {"type": "array", "items": {"type": "string"}, "description": "Array of element IDs to get properties for"},
-            "parameter_names": {"type": "array", "items": {"type": "string"}, "description": "Optional array of specific parameter names to retrieve (e.g., ['Sill Height', 'Width']). If not provided, gets common parameters."}
+            "element_ids": {"type": "array", "items": {"type": "string"}, "description": "Array of element IDs to get properties for (use only for small sets)."},
+            "result_handle": {"type": "string", "description": "Preferred. Handle from a previous search/filter result."},
+            "parameter_names": {"type": "array", "items": {"type": "string"}, "description": "Optional specific parameter names."},
+            "include_all_parameters": {"type": "boolean", "description": "If true, returns all discoverable instance/type parameter names and values."},
+            "populated_only": {"type": "boolean", "description": "If true, omit empty/'Not available' values. Works best with include_all_parameters=true."}
         },
-        "required": ["element_ids"]
+        "required": []
     }
-    UPDATE_ELEMENT_PARAMETERS_TOOL_DESCRIPTION_FOR_LLM = "Updates parameter values for elements. Use this to modify element properties like sill height, dimensions, comments, etc. You can either provide a detailed updates list or use the simplified form (element_ids + parameter_name + new_value) to push the same value to many elements. Always use this within a transaction context. IMPORTANT: This is typically the final step in an update workflow. When user requests parameter updates, chain: filter_elements -> get_element_properties -> update_element_parameters -> select_stored_elements in one conversation turn."
+    UPDATE_ELEMENT_PARAMETERS_TOOL_DESCRIPTION_FOR_LLM = "Updates parameter values for elements. Prefer result_handle + parameter_name + new_value for bulk updates after filtering."
     UPDATE_ELEMENT_PARAMETERS_TOOL_PARAMETERS_FOR_LLM = {
         "type": "object",
         "properties": {
@@ -840,11 +1600,12 @@ try:
                 },
                 "description": "Array of element updates"
             },
-            "element_ids": {"type": "array", "items": {"type": "string"}, "description": "Element IDs to update when using the simplified bulk update form"},
+            "element_ids": {"type": "array", "items": {"type": "string"}, "description": "Element IDs for simplified bulk updates (small sets)."},
+            "result_handle": {"type": "string", "description": "Preferred handle for bulk updates after filtering."},
             "parameter_name": {"type": "string", "description": "Parameter name to set (e.g., 'Install Level')"},
             "new_value": {"type": "string", "description": "New value to apply to the specified parameter"}
         },
-        "description": "Provide either a detailed 'updates' array or element_ids + parameter_name + new_value for bulk updates."
+        "description": "Provide either detailed 'updates', or (result_handle + parameter_name + new_value), or (element_ids + parameter_name + new_value)."
     }
 
 
@@ -887,11 +1648,14 @@ try:
     REVIT_TOOLS_SPEC_FOR_LLMS = {
         "openai": [
             {"type": "function", "function": {"name": REVIT_INFO_TOOL_NAME, "description": REVIT_INFO_TOOL_DESCRIPTION_FOR_LLM, "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {"name": GET_SCHEMA_CONTEXT_TOOL_NAME, "description": GET_SCHEMA_CONTEXT_TOOL_DESCRIPTION_FOR_LLM, "parameters": GET_SCHEMA_CONTEXT_TOOL_PARAMETERS_FOR_LLM}},
+            {"type": "function", "function": {"name": RESOLVE_TARGETS_TOOL_NAME, "description": RESOLVE_TARGETS_TOOL_DESCRIPTION_FOR_LLM, "parameters": RESOLVE_TARGETS_TOOL_PARAMETERS_FOR_LLM}},
             {"type": "function", "function": {"name": GET_ELEMENTS_BY_CATEGORY_TOOL_NAME, "description": GET_ELEMENTS_BY_CATEGORY_TOOL_DESCRIPTION_FOR_LLM, "parameters": GET_ELEMENTS_BY_CATEGORY_TOOL_PARAMETERS_FOR_LLM}},
             {"type": "function", "function": {"name": SELECT_ELEMENTS_TOOL_NAME, "description": SELECT_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, "parameters": SELECT_ELEMENTS_TOOL_PARAMETERS_FOR_LLM}},
             {"type": "function", "function": {"name": SELECT_STORED_ELEMENTS_TOOL_NAME, "description": SELECT_STORED_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, "parameters": SELECT_STORED_ELEMENTS_TOOL_PARAMETERS_FOR_LLM}},
             {"type": "function", "function": {"name": LIST_STORED_ELEMENTS_TOOL_NAME, "description": LIST_STORED_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, "parameters": LIST_STORED_ELEMENTS_TOOL_PARAMETERS_FOR_LLM}},
             {"type": "function", "function": {"name": FILTER_ELEMENTS_TOOL_NAME, "description": FILTER_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, "parameters": FILTER_ELEMENTS_TOOL_PARAMETERS_FOR_LLM}},
+            {"type": "function", "function": {"name": FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME, "description": FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_DESCRIPTION_FOR_LLM, "parameters": FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_PARAMETERS_FOR_LLM}},
             {"type": "function", "function": {"name": GET_ELEMENT_PROPERTIES_TOOL_NAME, "description": GET_ELEMENT_PROPERTIES_TOOL_DESCRIPTION_FOR_LLM, "parameters": GET_ELEMENT_PROPERTIES_TOOL_PARAMETERS_FOR_LLM}},
             {"type": "function", "function": {"name": UPDATE_ELEMENT_PARAMETERS_TOOL_NAME, "description": UPDATE_ELEMENT_PARAMETERS_TOOL_DESCRIPTION_FOR_LLM, "parameters": UPDATE_ELEMENT_PARAMETERS_TOOL_PARAMETERS_FOR_LLM}},
             {"type": "function", "function": {"name": PLACE_VIEW_ON_SHEET_TOOL_NAME, "description": PLACE_VIEW_ON_SHEET_TOOL_DESCRIPTION_FOR_LLM, "parameters": PLACE_VIEW_ON_SHEET_TOOL_PARAMETERS_FOR_LLM}},
@@ -900,11 +1664,14 @@ try:
         ],
         "anthropic": [
             {"name": REVIT_INFO_TOOL_NAME, "description": REVIT_INFO_TOOL_DESCRIPTION_FOR_LLM, "input_schema": {"type": "object", "properties": {}}},
+            {"name": GET_SCHEMA_CONTEXT_TOOL_NAME, "description": GET_SCHEMA_CONTEXT_TOOL_DESCRIPTION_FOR_LLM, "input_schema": GET_SCHEMA_CONTEXT_TOOL_PARAMETERS_FOR_LLM},
+            {"name": RESOLVE_TARGETS_TOOL_NAME, "description": RESOLVE_TARGETS_TOOL_DESCRIPTION_FOR_LLM, "input_schema": RESOLVE_TARGETS_TOOL_PARAMETERS_FOR_LLM},
             {"name": GET_ELEMENTS_BY_CATEGORY_TOOL_NAME, "description": GET_ELEMENTS_BY_CATEGORY_TOOL_DESCRIPTION_FOR_LLM, "input_schema": GET_ELEMENTS_BY_CATEGORY_TOOL_PARAMETERS_FOR_LLM},
             {"name": SELECT_ELEMENTS_TOOL_NAME, "description": SELECT_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, "input_schema": SELECT_ELEMENTS_TOOL_PARAMETERS_FOR_LLM},
             {"name": SELECT_STORED_ELEMENTS_TOOL_NAME, "description": SELECT_STORED_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, "input_schema": SELECT_STORED_ELEMENTS_TOOL_PARAMETERS_FOR_LLM},
             {"name": LIST_STORED_ELEMENTS_TOOL_NAME, "description": LIST_STORED_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, "input_schema": LIST_STORED_ELEMENTS_TOOL_PARAMETERS_FOR_LLM},
             {"name": FILTER_ELEMENTS_TOOL_NAME, "description": FILTER_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, "input_schema": FILTER_ELEMENTS_TOOL_PARAMETERS_FOR_LLM},
+            {"name": FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME, "description": FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_DESCRIPTION_FOR_LLM, "input_schema": FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_PARAMETERS_FOR_LLM},
             {"name": GET_ELEMENT_PROPERTIES_TOOL_NAME, "description": GET_ELEMENT_PROPERTIES_TOOL_DESCRIPTION_FOR_LLM, "input_schema": GET_ELEMENT_PROPERTIES_TOOL_PARAMETERS_FOR_LLM},
             {"name": UPDATE_ELEMENT_PARAMETERS_TOOL_NAME, "description": UPDATE_ELEMENT_PARAMETERS_TOOL_DESCRIPTION_FOR_LLM, "input_schema": UPDATE_ELEMENT_PARAMETERS_TOOL_PARAMETERS_FOR_LLM},
             {"name": PLACE_VIEW_ON_SHEET_TOOL_NAME, "description": PLACE_VIEW_ON_SHEET_TOOL_DESCRIPTION_FOR_LLM, "input_schema": PLACE_VIEW_ON_SHEET_TOOL_PARAMETERS_FOR_LLM},
@@ -914,11 +1681,14 @@ try:
         "google": [
             google_types.Tool(function_declarations=[
                 google_types.FunctionDeclaration(name=REVIT_INFO_TOOL_NAME, description=REVIT_INFO_TOOL_DESCRIPTION_FOR_LLM, parameters={"type": "object", "properties": {}}),
+                google_types.FunctionDeclaration(name=GET_SCHEMA_CONTEXT_TOOL_NAME, description=GET_SCHEMA_CONTEXT_TOOL_DESCRIPTION_FOR_LLM, parameters=GET_SCHEMA_CONTEXT_TOOL_PARAMETERS_FOR_LLM),
+                google_types.FunctionDeclaration(name=RESOLVE_TARGETS_TOOL_NAME, description=RESOLVE_TARGETS_TOOL_DESCRIPTION_FOR_LLM, parameters=RESOLVE_TARGETS_TOOL_PARAMETERS_FOR_LLM),
                 google_types.FunctionDeclaration(name=GET_ELEMENTS_BY_CATEGORY_TOOL_NAME, description=GET_ELEMENTS_BY_CATEGORY_TOOL_DESCRIPTION_FOR_LLM, parameters=GET_ELEMENTS_BY_CATEGORY_TOOL_PARAMETERS_FOR_LLM),
                 google_types.FunctionDeclaration(name=SELECT_ELEMENTS_TOOL_NAME, description=SELECT_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, parameters=SELECT_ELEMENTS_TOOL_PARAMETERS_FOR_LLM),
                 google_types.FunctionDeclaration(name=SELECT_STORED_ELEMENTS_TOOL_NAME, description=SELECT_STORED_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, parameters=SELECT_STORED_ELEMENTS_TOOL_PARAMETERS_FOR_LLM),
                 google_types.FunctionDeclaration(name=LIST_STORED_ELEMENTS_TOOL_NAME, description=LIST_STORED_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, parameters=LIST_STORED_ELEMENTS_TOOL_PARAMETERS_FOR_LLM),
                 google_types.FunctionDeclaration(name=FILTER_ELEMENTS_TOOL_NAME, description=FILTER_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, parameters=FILTER_ELEMENTS_TOOL_PARAMETERS_FOR_LLM),
+                google_types.FunctionDeclaration(name=FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME, description=FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_DESCRIPTION_FOR_LLM, parameters=FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_PARAMETERS_FOR_LLM),
                 google_types.FunctionDeclaration(name=GET_ELEMENT_PROPERTIES_TOOL_NAME, description=GET_ELEMENT_PROPERTIES_TOOL_DESCRIPTION_FOR_LLM, parameters=GET_ELEMENT_PROPERTIES_TOOL_PARAMETERS_FOR_LLM),
                 google_types.FunctionDeclaration(name=UPDATE_ELEMENT_PARAMETERS_TOOL_NAME, description=UPDATE_ELEMENT_PARAMETERS_TOOL_DESCRIPTION_FOR_LLM, parameters=UPDATE_ELEMENT_PARAMETERS_TOOL_PARAMETERS_FOR_LLM),
                 google_types.FunctionDeclaration(name=PLACE_VIEW_ON_SHEET_TOOL_NAME, description=PLACE_VIEW_ON_SHEET_TOOL_DESCRIPTION_FOR_LLM, parameters=PLACE_VIEW_ON_SHEET_TOOL_PARAMETERS_FOR_LLM),
@@ -941,6 +1711,24 @@ try:
         "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
     }
     app.logger.info("Configuration loaded.")
+
+    def _run_schema_warmup():
+        """Warm schema cache in a background thread so startup never blocks."""
+        try:
+            schema_warmup = get_revit_schema_context_mcp_tool(force_refresh=True)
+            if schema_warmup.get("status") == "success":
+                app.logger.info("Schema context cache warmup succeeded.")
+            else:
+                app.logger.warning("Schema context cache warmup skipped: %s", schema_warmup.get("message"))
+        except Exception as schema_warmup_err:
+            app.logger.warning("Schema context cache warmup failed: %s", schema_warmup_err)
+
+    warm_schema_on_startup = os.environ.get("REVITMCP_WARM_SCHEMA_ON_STARTUP", "true").strip().lower() in ("1", "true", "yes", "on")
+    if warm_schema_on_startup:
+        threading.Thread(target=_run_schema_warmup, name="revitmcp-schema-warmup", daemon=True).start()
+        app.logger.info("Schema context warmup launched in background thread.")
+    else:
+        app.logger.info("Schema context warmup disabled via REVITMCP_WARM_SCHEMA_ON_STARTUP.")
 
     @app.route('/', methods=['GET'])
     def chat_ui():
@@ -974,12 +1762,15 @@ For complex requests, use the plan_and_execute_workflow tool which allows you to
 
 AVAILABLE TOOLS FOR PLANNING:
 - get_revit_project_info: Get project information (no params)
+- get_revit_schema_context: Get canonical categories/levels/families/parameters (optional force_refresh)
+- resolve_revit_targets: Resolve user terms to exact Revit names (params: query_terms)
 - get_elements_by_category: Get all elements by category (params: category_name)
 - filter_elements: Advanced filtering (params: category_name, level_name, parameters)
-- get_element_properties: Get parameter values (params: element_ids, parameter_names)
-- update_element_parameters: Update parameters (params: updates OR element_ids + parameter_name + new_value)
-- select_elements_by_id: Select specific elements (params: element_ids)
-- select_stored_elements: Select stored elements (params: category_name)
+- filter_stored_elements_by_parameter: Server-side batched parameter filtering on stored sets (params: result_handle/category_name, parameter_name, value, operator)
+- get_element_properties: Get parameter values (params: result_handle OR element_ids, parameter_names, include_all_parameters, populated_only)
+- update_element_parameters: Update parameters (params: updates OR result_handle + parameter_name + new_value)
+- select_elements_by_id: Select specific elements (params: element_ids or result_handle)
+- select_stored_elements: Select stored elements (params: result_handle or category_name)
 - list_stored_elements: List available stored categories (no params)
 - place_view_on_sheet: Place view on new sheet (params: view_name, exact_match)
 - list_views: List all available views (no params)
@@ -993,15 +1784,20 @@ EXECUTION PLAN FORMAT:
   },
   {
     "tool": "update_element_parameters", 
-    "params": {"updates": [{"element_id": "${step_1_element_ids}", "parameters": {"Sill Height": "2' 6\""}}]},
+    "params": {"result_handle": "${step_1_result_handle}", "parameter_name": "Sill Height", "new_value": "2' 6\""},
     "description": "Update sill height to 2'6\""
   }
 ]
 
 WORKFLOW EXAMPLES:
 - Parameter updates: filter_elements → update_element_parameters → select_stored_elements
-- Property inspection: filter_elements → get_element_properties
-- Element discovery: get_elements_by_category → get_element_properties → select_stored_elements
+- Property inspection: get_elements_by_category → filter_stored_elements_by_parameter → get_element_properties
+- Element discovery: get_elements_by_category → filter_stored_elements_by_parameter → select_stored_elements
+
+IMPORTANT:
+- Always resolve terms with resolve_revit_targets before filter_elements or update_element_parameters.
+- For large sets, prefer filter_stored_elements_by_parameter before get_element_properties.
+- Do not use raw user category/level names directly.
 
 Use plan_and_execute_workflow for multi-step operations to provide complete results in one response."""
         }
@@ -1014,12 +1810,22 @@ Use plan_and_execute_workflow for multi-step operations to provide complete resu
             try:
                 if tool_name == REVIT_INFO_TOOL_NAME:
                     tool_result_data = get_revit_project_info_mcp_tool()
+                elif tool_name == GET_SCHEMA_CONTEXT_TOOL_NAME:
+                    tool_result_data = get_revit_schema_context_tool(force_refresh=normalized_args.get("force_refresh", False))
+                elif tool_name == RESOLVE_TARGETS_TOOL_NAME:
+                    tool_result_data = resolve_revit_targets_tool(query_terms=normalized_args.get("query_terms", {}))
                 elif tool_name == GET_ELEMENTS_BY_CATEGORY_TOOL_NAME:
                     tool_result_data = get_elements_by_category_mcp_tool(category_name=normalized_args.get("category_name"))
                 elif tool_name == SELECT_ELEMENTS_TOOL_NAME:
-                    tool_result_data = select_elements_by_id_mcp_tool(element_ids=normalized_args.get("element_ids", []))
+                    tool_result_data = select_elements_by_id_mcp_tool(
+                        element_ids=normalized_args.get("element_ids", []),
+                        result_handle=normalized_args.get("result_handle")
+                    )
                 elif tool_name == SELECT_STORED_ELEMENTS_TOOL_NAME:
-                    tool_result_data = select_stored_elements_mcp_tool(category_name=normalized_args.get("category_name"))
+                    tool_result_data = select_stored_elements_mcp_tool(
+                        category_name=normalized_args.get("category_name"),
+                        result_handle=normalized_args.get("result_handle")
+                    )
                 elif tool_name == LIST_STORED_ELEMENTS_TOOL_NAME:
                     tool_result_data = list_stored_elements_mcp_tool()
                 elif tool_name == FILTER_ELEMENTS_TOOL_NAME:
@@ -1028,15 +1834,29 @@ Use plan_and_execute_workflow for multi-step operations to provide complete resu
                         level_name=normalized_args.get("level_name"),
                         parameters=normalized_args.get("parameters", [])
                     )
+                elif tool_name == FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME:
+                    tool_result_data = filter_stored_elements_by_parameter_mcp_tool(
+                        parameter_name=normalized_args.get("parameter_name"),
+                        value=normalized_args.get("value"),
+                        operator=normalized_args.get("operator", "contains"),
+                        result_handle=normalized_args.get("result_handle"),
+                        category_name=normalized_args.get("category_name"),
+                        batch_size=normalized_args.get("batch_size"),
+                        case_sensitive=normalized_args.get("case_sensitive", False)
+                    )
                 elif tool_name == GET_ELEMENT_PROPERTIES_TOOL_NAME:
                     tool_result_data = get_element_properties_mcp_tool(
                         element_ids=normalized_args.get("element_ids", []),
-                        parameter_names=normalized_args.get("parameter_names", [])
+                        parameter_names=normalized_args.get("parameter_names", []),
+                        result_handle=normalized_args.get("result_handle"),
+                        include_all_parameters=normalized_args.get("include_all_parameters", False),
+                        populated_only=normalized_args.get("populated_only", False)
                     )
                 elif tool_name == UPDATE_ELEMENT_PARAMETERS_TOOL_NAME:
                     tool_result_data = update_element_parameters_mcp_tool(
                         updates=normalized_args.get("updates"),
                         element_ids=normalized_args.get("element_ids"),
+                        result_handle=normalized_args.get("result_handle"),
                         parameter_name=normalized_args.get("parameter_name"),
                         new_value=normalized_args.get("new_value")
                     )
